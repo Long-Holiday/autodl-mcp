@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "autodl": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/home/default_user/autodl_mcp",
+        "run",
+        "autodl-mcp"
+      ],
+      "env": {
+        "AUTODL_TOKEN_FILE": "/absolute/path/to/autodl.token",
+        "AUTODL_INSTANCE_ALLOWLIST": "your-instance-uuid"
+      }
+    }
+  }
+}
