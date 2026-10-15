@@ -35,7 +35,8 @@ def create_server(
         lifespan=lifespan,
         instructions=(
             "管理普通 AutoDL 容器实例，不适用于 Pro。开机会计费，关机会中断正在运行的任务。"
-            "开机任务在后台等待空闲 GPU，通过 job_status 查询、cancel_job 取消。"
+            "普通开机任务在后台等待空闲 GPU，无卡模式开机不申请 GPU，仅支持按量计费实例。"
+            "通过 job_status 查询开机任务、cancel_job 取消。"
             "取消或 MCP 服务退出不会自动关机；任务不跨服务重启恢复。"
         ),
     )
@@ -51,6 +52,16 @@ def create_server(
     )
     async def power_on(instance_uuid: str) -> dict[str, Any]:
         return await jobs().start(instance_uuid)
+
+    @server.tool(
+        description=(
+            "无卡模式开机（仍会计费，无 GPU）；仅支持按量计费实例，立即返回后台任务 ID。"
+            "不会自动将已运行的 GPU 实例切换为无卡模式，请先关机并确认状态。"
+        ),
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+    )
+    async def power_on_no_gpu(instance_uuid: str) -> dict[str, Any]:
+        return await jobs().start(instance_uuid, no_gpu=True)
 
     @server.tool(
         description="关机（中断实例上的运行任务）；先取消开机重试，返回接受结果而非最终状态。",

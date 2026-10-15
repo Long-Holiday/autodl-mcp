@@ -21,6 +21,9 @@ class FakeClient:
         }
         self.settings = Settings(token="test", **(defaults | settings))
         self.state = "shutdown"
+        self.start_mode = "gpu"
+        self.charge_type = "payg"
+        self.start_requests = []
         self.starts = 0
         self.stops = 0
         self.capacity_failures = 0
@@ -33,9 +36,15 @@ class FakeClient:
     async def status(self, uuid):
         if self.status_error:
             raise self.status_error
-        return {"instance_uuid": uuid, "status": self.state}
+        return {
+            "instance_uuid": uuid,
+            "status": self.state,
+            "start_mode": self.start_mode,
+            "charge_type": self.charge_type,
+        }
 
-    async def power_on(self, uuid):
+    async def power_on(self, uuid, *, no_gpu=False):
+        self.start_requests.append(no_gpu)
         self.starts += 1
         self.start_entered.set()
         if self.hold_start:
@@ -44,6 +53,7 @@ class FakeClient:
             raise AutoDLError("capacity", "缺货")
         if self.start_error:
             raise self.start_error
+        self.start_mode = "non_gpu" if no_gpu else "gpu"
         self.state = "running" if self.auto_running else "starting"
 
     async def power_off(self, uuid):
@@ -86,13 +96,14 @@ async def test_unknown_error_stops():
     assert client.starts == 1
 
 
-async def test_duplicate_start_and_shutdown_cancel_inflight():
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_duplicate_start_and_shutdown_cancel_inflight(no_gpu):
     client = FakeClient()
     client.hold_start = asyncio.Event()
     jobs = Jobs(client)
-    job = await jobs.start("target")
+    job = await jobs.start("target", no_gpu=no_gpu)
     await client.start_entered.wait()
-    duplicate = await jobs.start("target")
+    duplicate = await jobs.start("target", no_gpu=no_gpu)
     assert duplicate["job_id"] == job["job_id"]
     client.state = "starting"
     await jobs.stop("target")
@@ -102,10 +113,11 @@ async def test_duplicate_start_and_shutdown_cancel_inflight():
     assert client.state == "shutdown"
 
 
-async def test_cancel_before_background_task_runs():
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_cancel_before_background_task_runs(no_gpu):
     client = FakeClient()
     jobs = Jobs(client)
-    job = await jobs.start("target")
+    job = await jobs.start("target", no_gpu=no_gpu)
     result = await jobs.cancel(job["job_id"])
     assert result["phase"] == "cancelled"
     assert client.starts == 0
@@ -119,10 +131,11 @@ async def test_shutdown_is_idempotent():
     assert client.stops == 0
 
 
-async def test_cancel_does_not_stop_running_instance():
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_cancel_does_not_stop_running_instance(no_gpu):
     client = FakeClient()
     jobs = Jobs(client)
-    job = await jobs.start("target")
+    job = await jobs.start("target", no_gpu=no_gpu)
     await completed(jobs, job)
     result = await jobs.cancel(job["job_id"])
     assert result["phase"] == "succeeded"
@@ -140,21 +153,23 @@ async def test_capacity_wait_limit():
     assert client.starts < 100
 
 
-async def test_confirmation_timeout_does_not_resend():
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_confirmation_timeout_does_not_resend(no_gpu):
     client = FakeClient()
     client.auto_running = False
     jobs = Jobs(client)
-    result = await completed(jobs, await jobs.start("target"))
+    result = await completed(jobs, await jobs.start("target", no_gpu=no_gpu))
     assert result["phase"] == "failed"
     assert result["error"]["kind"] == "timeout"
     assert client.starts == 1
 
 
-async def test_ambiguous_mutation_never_resends():
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_ambiguous_mutation_never_resends(no_gpu):
     client = FakeClient()
     client.start_error = AutoDLError("network", "请求超时", ambiguous=True)
     jobs = Jobs(client)
-    result = await completed(jobs, await jobs.start("target"))
+    result = await completed(jobs, await jobs.start("target", no_gpu=no_gpu))
     assert result["phase"] == "failed"
     assert result["error"]["ambiguous"]
     assert client.starts == 1
@@ -169,27 +184,29 @@ async def test_network_queries_obey_configured_wait_limit():
     assert client.starts == 0
 
 
-async def test_shutting_down_blocks_start_after_stop_request():
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_shutting_down_blocks_start_after_stop_request(no_gpu):
     client = FakeClient()
     client.state = "running"
     jobs = Jobs(client)
     await jobs.stop("target")
     client.state = "shutting_down"
     with pytest.raises(ValueError, match="关机尚未确认"):
-        await jobs.start("target")
+        await jobs.start("target", no_gpu=no_gpu)
     client.state = "shutdown"
-    result = await completed(jobs, await jobs.start("target"))
+    result = await completed(jobs, await jobs.start("target", no_gpu=no_gpu))
     assert result["phase"] == "succeeded"
 
 
-async def test_close_cancels_tasks_and_rejects_starts():
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_close_cancels_tasks_and_rejects_starts(no_gpu):
     client = FakeClient()
     jobs = Jobs(client)
-    job = await jobs.start("target")
+    job = await jobs.start("target", no_gpu=no_gpu)
     await jobs.close()
     assert jobs.get(job["job_id"])["phase"] == "cancelled"
     with pytest.raises(ValueError, match="关闭"):
-        await jobs.start("target")
+        await jobs.start("target", no_gpu=no_gpu)
 
 
 @pytest.mark.parametrize("state", ["removing", "unknown", "shutting_down"])
@@ -371,3 +388,130 @@ async def test_long_sleep_is_interruptible(action):
         await asyncio.wait_for(jobs.stop("target"), timeout=0.2)
     assert jobs.get(job["job_id"])["phase"] == "cancelled"
     assert client.starts == 1
+
+
+async def test_no_gpu_start_success():
+    client = FakeClient()
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.start("target", no_gpu=True))
+    assert result["phase"] == "succeeded"
+    assert result["no_gpu"] is True
+    assert client.start_requests == [True]
+    assert client.start_mode == "non_gpu"
+
+
+@pytest.mark.parametrize("charge_type", ["yearly", None, ""])
+async def test_no_gpu_requires_payg_before_mutation(charge_type):
+    client = FakeClient()
+    client.charge_type = charge_type
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.start("target", no_gpu=True))
+    assert result["phase"] == "failed"
+    assert result["error"]["kind"] == "state"
+    assert "按量计费" in result["error"]["message"]
+    assert client.starts == 0
+
+
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_different_active_modes_conflict(no_gpu):
+    client = FakeClient()
+    client.hold_start = asyncio.Event()
+    jobs = Jobs(client)
+    try:
+        job = await jobs.start("target", no_gpu=no_gpu)
+        await client.start_entered.wait()
+        with pytest.raises(ValueError, match="不同开机模式"):
+            await jobs.start("target", no_gpu=not no_gpu)
+        assert len(jobs.jobs) == 1
+        assert jobs.get(job["job_id"])["no_gpu"] is no_gpu
+        assert client.starts == 1
+    finally:
+        await jobs.close()
+
+
+@pytest.mark.parametrize("no_gpu", [False, True])
+@pytest.mark.parametrize("state", ["running", "starting", "restarting"])
+async def test_existing_different_mode_never_mutates(no_gpu, state):
+    client = FakeClient()
+    client.state = state
+    client.start_mode = "gpu" if no_gpu else "non_gpu"
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.start("target", no_gpu=no_gpu))
+    assert result["phase"] == "failed"
+    assert result["error"]["kind"] == "state"
+    assert client.starts == client.stops == 0
+
+
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_existing_matching_mode_succeeds_without_mutation(no_gpu):
+    client = FakeClient()
+    client.state = "running"
+    client.start_mode = "non_gpu" if no_gpu else None
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.start("target", no_gpu=no_gpu))
+    assert result["phase"] == "succeeded"
+    assert client.starts == 0
+
+
+async def test_no_gpu_unknown_running_mode_never_succeeds_or_mutates(clock):
+    client = FakeClient()
+    client.state = "running"
+    client.start_mode = None
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.start("target", no_gpu=True))
+    assert result["phase"] == "failed"
+    assert result["error"]["kind"] == "timeout"
+    assert client.starts == 0
+
+
+@pytest.mark.parametrize("mode", [None, "gpu"])
+@pytest.mark.parametrize("ambiguous", [False, True])
+async def test_no_gpu_confirmation_requires_mode_without_resending(clock, mode, ambiguous):
+    client = FakeClient()
+
+    async def start(uuid, *, no_gpu=False):
+        assert no_gpu
+        client.starts += 1
+        client.state = "running"
+        client.start_mode = mode
+        if ambiguous:
+            raise AutoDLError("network", "请求超时", ambiguous=True)
+
+    client.power_on = start
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.start("target", no_gpu=True))
+    assert result["phase"] == "failed"
+    assert result["error"]["kind"] == ("uncertain" if ambiguous else "timeout")
+    assert result["error"]["ambiguous"] is ambiguous
+    assert client.starts == 1
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+async def test_no_gpu_confirmation_can_wait_for_mode(clock, ambiguous):
+    client = FakeClient()
+    reads = 0
+
+    async def start(uuid, *, no_gpu=False):
+        assert no_gpu
+        client.starts += 1
+        client.state = "running"
+        if ambiguous:
+            raise AutoDLError("network", "请求超时", ambiguous=True)
+
+    async def status(uuid):
+        nonlocal reads
+        reads += 1
+        return {
+            "status": client.state,
+            "charge_type": "payg",
+            "start_mode": "non_gpu" if reads >= 4 else None,
+        }
+
+    client.power_on = start
+    client.status = status
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.start("target", no_gpu=True))
+    assert result["phase"] == "succeeded"
+    assert reads == 4
+    assert client.starts == 1
+    assert result["error"] is None

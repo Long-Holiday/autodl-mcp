@@ -124,6 +124,7 @@ class AutoDLClient:
         if (
             mutation
             and path.endswith("/power_on")
+            and body.get("payload") != "non_gpu"
             and (
                 code in self.settings.capacity_codes
                 or any(phrase in normalized for phrase in CAPACITY_MESSAGES)
@@ -173,6 +174,12 @@ class AutoDLClient:
                             str,
                         )
                         else None,
+                        "start_mode": row.get("start_mode")
+                        if isinstance(row.get("start_mode"), str)
+                        else None,
+                        "charge_type": row.get("charge_type")
+                        if isinstance(row.get("charge_type"), str)
+                        else None,
                         "observed_at": datetime.now(UTC).isoformat(),
                     }
             observed += len(rows)
@@ -182,11 +189,14 @@ class AutoDLClient:
             if page > 1000:
                 raise AutoDLError("protocol", "实例列表分页超出安全上限")
 
-    async def power_on(self, instance_uuid: str) -> None:
+    async def power_on(self, instance_uuid: str, *, no_gpu: bool = False) -> None:
         self.settings.validate_uuid(instance_uuid)
+        body = {"instance_uuid": instance_uuid}
+        if no_gpu:
+            body["payload"] = "non_gpu"
         await self._post(
             "/api/v1/instance/power_on",
-            {"instance_uuid": instance_uuid},
+            body,
             mutation=True,
         )
 

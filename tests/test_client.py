@@ -23,6 +23,8 @@ async def test_pagination_and_secret_redaction():
                 {
                     "uuid": "target",
                     "status": "shutdown",
+                    "start_mode": "non_gpu",
+                    "charge_type": "payg",
                     "root_password": "sensitive",
                     "ssh_command": "secret ssh",
                     "name": "private account",
@@ -46,7 +48,16 @@ async def test_pagination_and_secret_redaction():
         assert result["status"] == "shutdown"
         assert len(seen) == 2
         assert seen[0]["status"] == []
-        assert set(result) == {"instance_uuid", "status", "sub_status", "observed_at"}
+        assert result["start_mode"] == "non_gpu"
+        assert result["charge_type"] == "payg"
+        assert set(result) == {
+            "instance_uuid",
+            "status",
+            "sub_status",
+            "start_mode",
+            "charge_type",
+            "observed_at",
+        }
         assert "sensitive" not in str(result)
     finally:
         await client.close()
@@ -115,7 +126,8 @@ async def test_capacity_is_narrow_and_terminal_errors_win(code, message, kind):
         (302, "http", True),
     ],
 )
-async def test_http_failures(status, kind, ambiguous):
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_http_failures(status, kind, ambiguous, no_gpu):
     client = AutoDLClient(
         Settings(token="test"),
         httpx.MockTransport(
@@ -124,21 +136,22 @@ async def test_http_failures(status, kind, ambiguous):
     )
     try:
         with pytest.raises(AutoDLError) as exc:
-            await client.power_on("test")
+            await client.power_on("test", no_gpu=no_gpu)
         assert exc.value.kind == kind
         assert exc.value.ambiguous == ambiguous
     finally:
         await client.close()
 
 
-async def test_network_mutation_is_ambiguous():
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_network_mutation_is_ambiguous(no_gpu):
     def handler(request):
         raise httpx.ReadTimeout("credential must not leak", request=request)
 
     client = AutoDLClient(Settings(token="test"), httpx.MockTransport(handler))
     try:
         with pytest.raises(AutoDLError) as exc:
-            await client.power_on("test")
+            await client.power_on("test", no_gpu=no_gpu)
         assert exc.value.ambiguous
         assert "credential" not in str(exc.value)
     finally:
@@ -209,7 +222,8 @@ async def test_server_can_cap_requested_page_size():
 
 
 @pytest.mark.parametrize("payload", ["not json", "[]", '{"data": null}'])
-async def test_invalid_response_is_ambiguous_for_mutations(payload):
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_invalid_response_is_ambiguous_for_mutations(payload, no_gpu):
     client = AutoDLClient(
         Settings(token="test"),
         httpx.MockTransport(
@@ -218,7 +232,7 @@ async def test_invalid_response_is_ambiguous_for_mutations(payload):
     )
     try:
         with pytest.raises(AutoDLError) as exc:
-            await client.power_on("target")
+            await client.power_on("target", no_gpu=no_gpu)
         assert exc.value.kind == "protocol"
         assert exc.value.ambiguous
     finally:
@@ -252,7 +266,8 @@ def test_parse_retry_after_http_date():
 
 
 @pytest.mark.parametrize("status", [429, 503])
-async def test_retry_after_is_exposed_safely(status):
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_retry_after_is_exposed_safely(status, no_gpu):
     client = AutoDLClient(
         Settings(token="test"),
         httpx.MockTransport(
@@ -261,9 +276,73 @@ async def test_retry_after_is_exposed_safely(status):
     )
     try:
         with pytest.raises(AutoDLError) as exc:
-            await client.power_on("target")
+            await client.power_on("target", no_gpu=no_gpu)
         assert exc.value.retry_after == 1200
         assert exc.value.as_dict()["retry_after"] == 1200
         assert exc.value.ambiguous
+    finally:
+        await client.close()
+
+
+async def test_no_gpu_mutation_contract():
+    def handler(request):
+        assert request.method == "POST"
+        assert request.url.path == "/api/v1/instance/power_on"
+        assert json.loads(request.content) == {"instance_uuid": "abc-123", "payload": "non_gpu"}
+        return httpx.Response(200, json={"code": "Success", "data": None})
+
+    client = AutoDLClient(Settings(token="test"), httpx.MockTransport(handler))
+    try:
+        await client.power_on("abc-123", no_gpu=True)
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize("code", ["Error", "ConfirmedNoGPU", "WrongStartMode"])
+async def test_no_gpu_never_retries_gpu_capacity_errors(code):
+    client = AutoDLClient(
+        Settings(token="test", capacity_codes=frozenset({"ConfirmedNoGPU"})),
+        httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"code": code, "msg": "无空闲GPU secret"})
+        ),
+    )
+    try:
+        with pytest.raises(AutoDLError) as exc:
+            await client.power_on("target", no_gpu=True)
+        assert exc.value.kind == "business"
+        assert not exc.value.ambiguous
+        assert "secret" not in str(exc.value)
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize("value,expected", [(None, None), (123, None), ({}, None), ("gpu", "gpu")])
+async def test_status_mode_fields_are_optional_strings(value, expected):
+    client = AutoDLClient(
+        Settings(token="test"),
+        httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "code": "Success",
+                    "data": {
+                        "list": [
+                            {
+                                "uuid": "target",
+                                "status": "running",
+                                "start_mode": value,
+                                "charge_type": value,
+                            }
+                        ],
+                        "result_total": 1,
+                    },
+                },
+            )
+        ),
+    )
+    try:
+        result = await client.status("target")
+        assert result["start_mode"] == expected
+        assert result["charge_type"] == expected
     finally:
         await client.close()

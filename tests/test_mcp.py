@@ -15,6 +15,7 @@ MOCK_SERVER_PATH = str(Path(__file__).resolve())
 
 def run_mock_server():
     state = {"target": "shutdown", "waiting": "shutdown"}
+    modes = {}
 
     def handler(request):
         body = json.loads(request.content)
@@ -25,7 +26,13 @@ def run_mock_server():
                     "code": "Success",
                     "data": {
                         "list": [
-                            {"uuid": uuid, "status": status, "root_password": "secret"}
+                            {
+                                "uuid": uuid,
+                                "status": status,
+                                "root_password": "secret",
+                                "charge_type": "payg",
+                                "start_mode": modes.get(uuid),
+                            }
                             for uuid, status in state.items()
                         ],
                         "result_total": 2,
@@ -33,12 +40,15 @@ def run_mock_server():
                 },
             )
         uuid = body["instance_uuid"]
-        if request.url.path.endswith("power_on"):
+        if request.url.path == "/api/v1/instance/power_on":
             if uuid == "waiting":
                 return httpx.Response(200, json={"code": "Error", "msg": "无空闲机器"})
             state[uuid] = "running"
-        else:
+            modes[uuid] = "non_gpu" if body.get("payload") == "non_gpu" else "gpu"
+        elif request.url.path == "/api/v1/instance/power_off":
             state[uuid] = "shutdown"
+        else:
+            raise AssertionError(f"Unexpected request: {request.url.path}")
         return httpx.Response(200, json={"code": "Success", "data": None})
 
     create_server(
@@ -55,6 +65,7 @@ async def test_stdio_protocol_and_all_tools():
         tools = (await session.list_tools()).tools
         assert {t.name for t in tools} == {
             "power_on",
+            "power_on_no_gpu",
             "power_off",
             "instance_status",
             "job_status",
@@ -78,6 +89,22 @@ async def test_stdio_protocol_and_all_tools():
         assert stopped.structured_content["accepted"]
         status = await session.call_tool("instance_status", {"instance_uuid": "target"})
         assert status.structured_content["status"] == "shutdown"
+        no_gpu = await session.call_tool("power_on_no_gpu", {"instance_uuid": "target"})
+        assert not no_gpu.is_error
+        assert no_gpu.structured_content["no_gpu"] is True
+        for _ in range(30):
+            job = await session.call_tool(
+                "job_status", {"job_id": no_gpu.structured_content["job_id"]}
+            )
+            if job.structured_content["phase"] == "succeeded":
+                break
+            await asyncio.sleep(0.01)
+        assert job.structured_content["phase"] == "succeeded"
+        status = await session.call_tool("instance_status", {"instance_uuid": "target"})
+        assert status.structured_content["start_mode"] == "non_gpu"
+        assert "secret" not in str(status)
+        stopped = await session.call_tool("power_off", {"instance_uuid": "target"})
+        assert stopped.structured_content["accepted"]
         waiting = await session.call_tool("power_on", {"instance_uuid": "waiting"})
         cancel = await session.call_tool(
             "cancel_job",
@@ -98,7 +125,7 @@ async def test_real_entrypoint_discovery_without_remote_requests():
     )
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
-        assert len((await session.list_tools()).tools) == 5
+        assert len((await session.list_tools()).tools) == 6
 
 
 if __name__ == "__main__":

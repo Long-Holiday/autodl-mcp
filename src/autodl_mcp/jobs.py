@@ -23,6 +23,7 @@ ACTIVE = {"queued", "checking", "waiting_capacity", "waiting_network", "starting
 @dataclass
 class Job:
     instance_uuid: str
+    no_gpu: bool = False
     job_id: str = field(default_factory=lambda: uuid4().hex)
     phase: str = "queued"
     attempts: int = 0
@@ -37,6 +38,7 @@ class Job:
         return {
             "job_id": self.job_id,
             "instance_uuid": self.instance_uuid,
+            "no_gpu": self.no_gpu,
             "phase": self.phase,
             "attempts": self.attempts,
             "last_status": self.last_status,
@@ -69,7 +71,7 @@ class Jobs:
             None,
         )
 
-    async def start(self, instance_uuid: str) -> dict[str, Any]:
+    async def start(self, instance_uuid: str, *, no_gpu: bool = False) -> dict[str, Any]:
         self.settings.validate_uuid(instance_uuid)
         async with self._lock(instance_uuid):
             if self.closed:
@@ -80,6 +82,8 @@ class Jobs:
                     raise ValueError("该实例的关机尚未确认，请稍后查询状态")
                 self.shutdown_pending.remove(instance_uuid)
             if job := self._active(instance_uuid):
+                if job.no_gpu != no_gpu:
+                    raise ValueError("该实例已有不同开机模式的活动任务，请先取消并确认实例状态")
                 return job.snapshot()
             if len(self.jobs) >= 1000:
                 completed = next(
@@ -88,7 +92,7 @@ class Jobs:
                 if completed is None:
                     raise ValueError("活动任务已达上限，请取消部分任务")
                 del self.jobs[completed]
-            job = Job(instance_uuid)
+            job = Job(instance_uuid, no_gpu=no_gpu)
             self.jobs[job.job_id] = job
             job.task = asyncio.create_task(self._run(job), name=f"autodl-start-{job.job_id}")
             return job.snapshot()
@@ -147,10 +151,17 @@ class Jobs:
         await asyncio.sleep(delay)
         job.next_retry_at = None
 
-    async def _observe(self, job: Job) -> str:
-        status = (await self.client.status(job.instance_uuid))["status"]
-        job.last_status = status
-        return status
+    async def _observe(self, job: Job) -> dict[str, Any]:
+        observation = await self.client.status(job.instance_uuid)
+        job.last_status = observation["status"]
+        return observation
+
+    def _running_matches(self, job: Job, observation: dict[str, Any]) -> bool:
+        if observation["status"] != "running":
+            return False
+        if job.no_gpu:
+            return observation.get("start_mode") == "non_gpu"
+        return observation.get("start_mode") != "non_gpu"
 
     def _retry_delay(self, base: float, ceiling: float, retry_after: float | None = None) -> float:
         delay = min(base, ceiling) * random.uniform(1 - self.settings.retry_jitter, 1)
@@ -175,7 +186,8 @@ class Jobs:
             transient_delay = min(transient_delay * 1.5, self.settings.transient_retry_max_interval)
         while time.monotonic() < deadline:
             try:
-                status = await self._observe(job)
+                observation = await self._observe(job)
+                status = observation["status"]
             except AutoDLError as exc:
                 if exc.kind not in {"network", "rate_limit"}:
                     raise
@@ -192,10 +204,14 @@ class Jobs:
             else:
                 transient_delay = self.settings.transient_retry_interval
                 job.error = None
-                if status == "running":
+                if self._running_matches(job, observation):
                     self._finish(job, "succeeded")
                     return
-                if not ambiguous and status not in STARTABLE | {"starting", "restarting"}:
+                if not ambiguous and status not in STARTABLE | {
+                    "starting",
+                    "restarting",
+                    "running",
+                }:
                     raise AutoDLError("state", "开机确认时实例进入非预期状态，请查看控制台")
                 if not ambiguous and status in {
                     "shutdown_by_starting_error",
@@ -224,20 +240,34 @@ class Jobs:
                     raise AutoDLError("timeout", "已达到开机最大等待时间")
                 job.phase = "checking"
                 try:
-                    status = await self._observe(job)
+                    observation = await self._observe(job)
+                    status = observation["status"]
                     transient_delay = self.settings.transient_retry_interval
-                    if status == "running":
+                    if status in {"running", "starting", "restarting"}:
+                        mode = observation.get("start_mode")
+                        if (mode == "non_gpu" and not job.no_gpu) or (
+                            job.no_gpu and mode and mode != "non_gpu"
+                        ):
+                            raise AutoDLError(
+                                "state", "实例已以其他模式运行或启动，请先关机后再选择开机模式"
+                            )
+                    if self._running_matches(job, observation):
                         job.error = None
                         self._finish(job, "succeeded")
                         return
-                    if status in {"starting", "restarting"}:
+                    if status in {"starting", "restarting", "running"}:
                         await self._confirm(job)
                         return
                     if status not in STARTABLE:
                         raise AutoDLError("state", "实例当前状态不允许开机，请查看控制台")
+                    if job.no_gpu and observation.get("charge_type") != "payg":
+                        raise AutoDLError("state", "无卡模式开机仅支持按量计费实例")
                     job.phase = "starting"
                     job.attempts += 1
-                    await self.client.power_on(job.instance_uuid)
+                    if job.no_gpu:
+                        await self.client.power_on(job.instance_uuid, no_gpu=True)
+                    else:
+                        await self.client.power_on(job.instance_uuid)
                 except AutoDLError as exc:
                     job.error = exc.as_dict()
                     if exc.ambiguous:
