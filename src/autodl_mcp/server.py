@@ -96,7 +96,7 @@ def create_server(
 
 def main() -> None:
     try:
-        settings = Settings.from_env()
+        settings = Settings.load()
     except ValueError as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
         raise SystemExit(2) from None

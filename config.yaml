@@ -1,0 +1,36 @@
+# AutoDL MCP 配置，随代码提交，请勿写入任何密钥。
+#
+# token 不在本文件中：请在你的 MCP 客户端配置里通过 env 传入 AUTODL_TOKEN，
+# 见 mcp-config.example.json。
+#
+# 这里每一项都可以被同名环境变量覆盖，例如 AUTODL_REQUEST_TIMEOUT=60。
+# 用 AUTODL_CONFIG=/path/to/config.yaml 可以让服务读取其他位置的本文件。
+
+# 允许操作的实例 UUID；空列表表示允许全部自有实例（有风险，建议按需填写）。
+instance_allowlist: []
+
+# 只有确认「该返回码只代表 GPU/机器无空闲」时才添加。
+capacity_codes: []
+
+# 缺货重试：间隔从 retry_interval 起按倍数增长，上限 retry_max_interval。
+retry_interval: 60
+retry_max_interval: 300
+
+# 退避抖动比例，取值 [0, 1)；0.3 表示实际等待在 70%~100% 之间随机。
+retry_jitter: 0.3
+
+# 网络类错误（超时、连接失败）的退避间隔，通常比缺货重试更保守。
+transient_retry_interval: 60
+transient_retry_max_interval: 900
+
+# 等待空闲 GPU 的总时长上限（秒），0 表示不限时；任务不跨服务重启恢复。
+max_wait_seconds: 0
+
+# 开机状态轮询间隔（秒）。
+poll_interval: 5
+
+# 单次开机请求的等待上限（秒）。
+start_timeout: 600
+
+# 单次 HTTP 请求超时（秒）。
+request_timeout: 30
