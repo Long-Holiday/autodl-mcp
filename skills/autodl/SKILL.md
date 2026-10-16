@@ -1,6 +1,7 @@
 ---
 name: autodl
 description: 管理 AutoDL 容器实例：开机（含无卡模式）、关机、查询实例状态与后台开机任务；缺货时后台按指数退避自动重试，不要手动反复调用。Use when the user asks to start, stop, restart, or check an AutoDL instance, when a GPU instance is out of capacity and needs waiting, or when a task fails because the instance is powered off. Not for AutoDL Pro (专业版) instances.
+license: MIT
 allowed-tools: mcp__autodl__instance_status, mcp__autodl__job_status
 ---
 

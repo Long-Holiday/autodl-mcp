@@ -92,3 +92,7 @@ uv run ruff check .
 ```
 
 仓库约定见 [AGENTS.md](AGENTS.md)。
+
+## 许可证
+
+[MIT](LICENSE)

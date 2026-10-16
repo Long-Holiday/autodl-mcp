@@ -7,5 +7,6 @@
     "name": "Long-Holiday"
   },
   "repository": "https://github.com/Long-Holiday/autodl-mcp",
+  "license": "MIT",
   "keywords": ["autodl", "gpu", "mcp", "instance-management"]
 }
