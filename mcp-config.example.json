@@ -2,12 +2,7 @@
   "mcpServers": {
     "autodl": {
       "command": "uv",
-      "args": [
-        "--directory",
-        "/home/default_user/autodl_mcp",
-        "run",
-        "autodl-mcp"
-      ],
+      "args": ["run", "--directory", "/path/to/autodl-mcp", "autodl-mcp"],
       "env": {
         "AUTODL_TOKEN": "<浏览器 DevTools -> Network -> 实例请求 -> Authorization 头，填控制台登录 Token 原文，不要加 Bearer 前缀>",
         "AUTODL_INSTANCE_ALLOWLIST": "your-instance-uuid"

@@ -8,7 +8,7 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
 from autodl_mcp.client import AutoDLClient
-from autodl_mcp.config import Settings
+from autodl_mcp.config import Settings, config_source
 from autodl_mcp.jobs import Jobs
 
 
@@ -94,7 +94,37 @@ def create_server(
     return server
 
 
+def _masked(token: str) -> str:
+    """自检输出里只显示 Token 的首尾各 4 位，避免日志泄露完整凭证。"""
+    return f"{token[:4]}…{token[-4:]}" if len(token) > 12 else "已设置"
+
+
+def check() -> None:
+    """自检：只验证入口与配置能否加载，不访问网络。用于安装插件后确认启动链路可用。"""
+    print("autodl-mcp 自检：入口与依赖正常", flush=True)
+    try:
+        settings = Settings.load()
+        source = config_source()
+    except ValueError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    print(f"配置文件：{source}" if source else "配置文件：未找到 config.yaml，全部使用内置默认值")
+    print(f"AUTODL_TOKEN：{_masked(settings.token)}")
+    print(
+        "实例白名单："
+        + (
+            "、".join(sorted(settings.instance_allowlist))
+            if settings.instance_allowlist
+            else "未限制（允许全部自有实例）"
+        )
+    )
+    print("自检通过；Token 是否有效要等第一次真实请求才能确认。")
+
+
 def main() -> None:
+    if sys.argv[1:2] == ["--check"]:
+        check()
+        return
     try:
         settings = Settings.load()
     except ValueError as exc:

@@ -45,7 +45,11 @@ class Settings:
 
     def __post_init__(self) -> None:
         if not self.token or any(c.isspace() for c in self.token):
-            raise ValueError("需要有效的 AutoDL 控制台登录 Token（不含 Bearer 前缀）")
+            raise ValueError(
+                "缺少 AutoDL 控制台登录 Token：请在 agent 的 MCP 配置里为 autodl 服务设置环境变量 "
+                "AUTODL_TOKEN，或在 shell 中 export AUTODL_TOKEN="
+                "<控制台登录 Token 原文，不含 Bearer 前缀>"
+            )
         for name in _NUMBER_FIELDS:
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0 or (name != "max_wait_seconds" and value == 0):
@@ -89,6 +93,11 @@ def _config_path(config_path: Path | None) -> Path | None:
     if not path.is_file():
         raise ValueError(f"找不到配置文件：{path}")
     return path
+
+
+def config_source() -> Path | None:
+    """本次启动会读取的配置文件；返回 None 表示没找到文件、全部走内置默认值。"""
+    return _config_path(None)
 
 
 def _read_config_file(config_path: Path | None) -> dict[str, Any]:

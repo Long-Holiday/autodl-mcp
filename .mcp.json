@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "autodl": {
+      "command": "uv",
+      "args": ["run", "autodl-mcp"]
+    }
+  }
+}
