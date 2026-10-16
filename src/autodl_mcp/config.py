@@ -46,7 +46,7 @@ class Settings:
     def __post_init__(self) -> None:
         if not self.token or any(c.isspace() for c in self.token):
             raise ValueError(
-                "缺少 AutoDL 控制台登录 Token：请在 agent 的 MCP 配置里为 autodl 服务设置环境变量 "
+                "缺少 AutoDL 控制台登录 Token：请在 Antigravity 里为 autodl 服务设置环境变量 "
                 "AUTODL_TOKEN，或在 shell 中 export AUTODL_TOKEN="
                 "<控制台登录 Token 原文，不含 Bearer 前缀>"
             )

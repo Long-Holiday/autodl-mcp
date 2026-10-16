@@ -2,7 +2,7 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "autodl-mcp",
   "version": "0.1.0",
-  "description": "管理 AutoDL 容器实例：开机（含无卡模式）、关机、查询实例与后台开机任务状态，缺货自动后台重试。Manage AutoDL console instances from any coding agent — power on/off, GPU-less mode, capacity retry.",
+  "description": "管理 AutoDL 容器实例：开机（含无卡模式）、关机、查询实例与后台开机任务状态，缺货自动后台重试。Manage AutoDL console instances from Antigravity — power on/off, GPU-less mode, capacity retry.",
   "author": {
     "name": "Long-Holiday"
   },
@@ -12,8 +12,8 @@
     "autodl",
     "gpu",
     "mcp",
+    "antigravity",
     "instance-management",
-    "power-management",
-    "agent-plugin"
+    "power-management"
   ]
 }

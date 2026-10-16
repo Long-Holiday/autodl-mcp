@@ -1,4 +1,4 @@
-"""插件清单校验：格式合规、三份 MCP 配置一致、任何文件里都不含 token。"""
+"""插件清单校验：格式合规、MCP 配置、面向 Antigravity 的打包、任何文件里都不含 token。"""
 
 import json
 import re
@@ -27,17 +27,29 @@ PLUGIN_FIELDS = {
 PLUGIN_NAME = re.compile(r"^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 STDIO_FIELDS = {"type", "command", "args", "env", "cwd"}
 SERVER_NAME = "autodl"
-CLAUDE_MCP = ROOT / ".mcp.json"
 
-# 三份 MCP 配置：(文件, 是否带 $schema 与 type)
-# 故意不使用 ${PLUGIN_ROOT} 之类的占位符：cwd 默认就是插件根目录（Agent Plugins 规范与
-# Claude Code 都这么定义），所以相对路径就够，少依赖一个客户端行为。
-# Claude Code 不会展开规范里的 ${PLUGIN_ROOT}（只认自己的 ${CLAUDE_PLUGIN_ROOT}）。
-MCP_CONFIGS = [
-    (ROOT / "mcp.json", True),
-    (ROOT / "mcp_config.json", False),
-    (CLAUDE_MCP, False),
+# 只面向 Antigravity：插件清单就一份标准格式。
+# 实测 agy 1.4.0 读的是这里；别的 agent 的私有清单/配置（.claude-plugin/、.cursor-plugin/、
+# .mcp.json、mcp_config.json）都已经删掉，不该再加回来（见 test_only_antigravity_packaging）。
+MCP_CONFIG = ROOT / "mcp.json"
+
+# 对外文件：都得存在，且都不许提到别的 agent（代码里提到=又接了一条安装路径，
+# 文档里提到=又在向别人承诺支持）。
+AGENT_FACING_FILES = [
+    "plugin.json",
+    "mcp.json",
+    "mcp-config.example.json",
+    "README.md",
+    "INSTALL.md",
+    "AGENTS.md",
+    "skills/autodl/SKILL.md",
+    "src/autodl_mcp/install.py",
 ]
+OTHER_AGENTS = re.compile(
+    r"\b(claude|anthropic|cursor|codex|copilot|windsurf|cline|roo|kiro|qwen|zed|opencode|"
+    r"gemini|continue)\b",
+    re.IGNORECASE,
+)
 
 
 def load(path: Path):
@@ -55,90 +67,62 @@ def test_agent_plugins_manifest():
     assert manifest["version"] == _project_version()
 
 
-def _project_version() -> str:
-    """版本号以 pyproject.toml 为准，避免三份清单各写各的。"""
-    for line in (ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines():
-        if line.startswith("version = "):
-            return line.split("=", 1)[1].strip().strip('"')
-    raise AssertionError("pyproject.toml 里没有 version")
-
-
-@pytest.mark.parametrize(("path", "typed"), MCP_CONFIGS)
-def test_mcp_config_shape(path, typed):
-    config = load(path)
-    if typed:  # 只有 Agent Plugins 标准那份带 $schema
-        assert config["$schema"] == MCP_SCHEMA
-        assert set(config) <= {"$schema", "mcpServers"}
-    else:
-        assert set(config) == {"mcpServers"}
+def test_mcp_config_shape():
+    config = load(MCP_CONFIG)
+    assert config["$schema"] == MCP_SCHEMA
+    assert set(config) <= {"$schema", "mcpServers"}
 
     assert set(config["mcpServers"]) == {SERVER_NAME}
     server = config["mcpServers"][SERVER_NAME]
     assert set(server) <= STDIO_FIELDS
-    if typed:
-        assert server["type"] == "stdio"
-    else:
-        assert "type" not in server, "Antigravity / Claude Code 的原生配置不接受 type 字段"
+    assert server["type"] == "stdio"
 
     # command 必须是单个可执行 token，不能是 shell 字符串
     assert server["command"] == "uv"
     assert " " not in server["command"] and "${" not in server["command"]
-    # args 用相对路径：cwd 默认是插件根目录，这样哪个客户端都不需要展开占位符
+    # args 用相对路径：cwd 默认是插件根目录，这样不需要展开占位符
     assert server["args"] == ["run", "autodl-mcp"]
-    assert "env" not in server, "环境变量由用户自己在客户端配置里给，插件不预设"
+    assert "env" not in server, "环境变量由用户自己在 agy 的 MCP 配置里给，插件不预设"
 
 
 def test_no_placeholder_dependency():
-    """三份配置里都不能出现占位符。
+    """配置里不能出现占位符。
 
-    客户端对占位符的支持参差不齐（Claude Code 就不展开规范里的 ${PLUGIN_ROOT}），
-    一旦没展开会静默变成字面量路径，很难排查。所以干脆一个都不用。
+    客户端对占位符的支持参差不齐，一旦没展开会静默变成字面量路径，很难排查。所以一个都不用。
     """
-    for path, _typed in MCP_CONFIGS:
-        assert "${" not in path.read_text(encoding="utf-8")
+    assert "${" not in MCP_CONFIG.read_text(encoding="utf-8")
 
 
-def test_three_mcp_configs_describe_one_server():
-    """三份配置除标准那份多一个 type 外，服务定义必须完全一致。"""
-    shapes = {
-        json.dumps(
-            {k: v for k, v in load(path)["mcpServers"][SERVER_NAME].items() if k != "type"}
-        )
-        for path, _typed in MCP_CONFIGS
-    }
-    assert len(shapes) == 1, "三份 MCP 配置描述的启动方式不一致"
+def test_only_antigravity_packaging():
+    """本插件只发给 Antigravity；别的 agent 的清单/配置不许回来。"""
+    for stray in (
+        ".claude-plugin",
+        ".cursor-plugin",
+        ".mcp.json",
+        "mcp_config.json",
+        "GEMINI.md",
+    ):
+        assert not (ROOT / stray).exists(), f"{stray} 属于别的 agent，本仓库只面向 Antigravity"
 
 
-def test_claude_plugin_and_marketplace():
-    manifest = load(ROOT / ".claude-plugin" / "plugin.json")
-    assert manifest["name"] == "autodl-mcp"
-    # Claude Code 拒绝冒用官方名字的插件名
-    assert not manifest["name"].startswith(("claude-", "anthropic-", "cc-plugin-"))
-
-    marketplace = load(ROOT / ".claude-plugin" / "marketplace.json")
-    assert marketplace["name"] and marketplace["owner"]["name"]
-    entries = marketplace["plugins"]
-    assert [entry["name"] for entry in entries] == ["autodl-mcp"]
-    assert entries[0]["source"] == "./"
-
-
-def test_cursor_plugin_and_marketplace():
-    manifest = load(ROOT / ".cursor-plugin" / "plugin.json")
-    assert manifest["name"] == "autodl-mcp"
-
-    marketplace = load(ROOT / ".cursor-plugin" / "marketplace.json")
-    assert [entry["name"] for entry in marketplace["plugins"]] == ["autodl-mcp"]
-    assert marketplace["plugins"][0]["source"] == "."
+def test_no_other_agent_names_in_agent_facing_files():
+    for name in AGENT_FACING_FILES:
+        text = (ROOT / name).read_text(encoding="utf-8")
+        found = sorted({m.group(0).lower() for m in OTHER_AGENTS.finditer(text)})
+        assert not found, f"{name} 里提到了别的 agent：{found}"
 
 
 def test_all_manifests_agree_on_version():
-    versions = {
-        load(ROOT / "plugin.json")["version"],
-        load(ROOT / ".claude-plugin" / "plugin.json")["version"],
-        load(ROOT / ".cursor-plugin" / "plugin.json")["version"],
-        _project_version(),
-    }
+    versions = {load(ROOT / "plugin.json")["version"], _project_version()}
     assert len(versions) == 1, f"版本号不一致：{versions}"
+
+
+def _project_version() -> str:
+    """版本号以 pyproject.toml 为准，避免清单和包各写各的。"""
+    for line in (ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines():
+        if line.startswith("version = "):
+            return line.split("=", 1)[1].strip().strip('"')
+    raise AssertionError("pyproject.toml 里没有 version")
 
 
 def test_skill_frontmatter_and_safety():
@@ -146,7 +130,7 @@ def test_skill_frontmatter_and_safety():
     text = skill.read_text(encoding="utf-8")
     assert text.startswith("---\n")
     frontmatter = yaml.safe_load(text.split("---", 2)[1])
-    # 目录名必须与技能名一致，description 要带英文关键词供模型路由和插件市场检索
+    # 目录名必须与技能名一致，description 要带英文关键词供模型路由
     assert frontmatter["name"] == skill.parent.name
     assert "autodl" in frontmatter["description"].lower()
     assert "AutoDL" in frontmatter["description"]
@@ -163,7 +147,7 @@ def test_skill_frontmatter_and_safety():
 
 def test_no_token_committed_anywhere():
     """仓库里任何配置文件都不能出现真实 token；示例文件只允许占位符。"""
-    for path in [*(path for path, _typed in MCP_CONFIGS), ROOT / "mcp-config.example.json"]:
+    for path in (MCP_CONFIG, ROOT / "mcp-config.example.json"):
         text = path.read_text(encoding="utf-8")
         if "AUTODL_TOKEN" not in text:
             continue
@@ -175,14 +159,17 @@ def test_no_token_committed_anywhere():
     # 随代码提交的 config.yaml 会被 Settings.load() 拒绝写入 token，这里再兜一层
     config = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8")) or {}
     assert "token" not in config
-    # 插件清单里根本不该提到 token：值由用户自己在客户端配置里给
+    # 插件清单里根本不该提到 token：值由用户自己在 agy 的 MCP 配置里给
     assert "AUTODL_TOKEN" not in (ROOT / "plugin.json").read_text(encoding="utf-8")
 
 
-def test_plugin_root_has_no_real_claude_md():
-    """真实的根 CLAUDE.md 会让 claude plugin validate --strict 失败，必须是符号链接。"""
-    if not (ROOT / "CLAUDE.md").exists():
-        pytest.skip("Windows 未启用符号链接的检出")
-    assert (ROOT / "CLAUDE.md").is_symlink()
-    assert (ROOT / "CLAUDE.md").readlink() == Path("AGENTS.md")
-    assert (ROOT / "GEMINI.md").is_symlink()
+def test_repo_root_has_no_agent_instruction_files():
+    """仓库约定只有 AGENTS.md 一份，别的 agent 的约定文件不要出现。"""
+    assert (ROOT / "AGENTS.md").is_file()
+    for name in ("CLAUDE.md", "GEMINI.md"):
+        assert not (ROOT / name).exists(), f"{name} 是别的 agent 的约定文件"
+
+
+@pytest.mark.parametrize("name", AGENT_FACING_FILES)
+def test_agent_facing_files_exist(name):
+    assert (ROOT / name).is_file(), f"{name} 不该被删掉或改名"

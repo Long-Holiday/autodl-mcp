@@ -1,22 +1,16 @@
 # autodl-mcp
 
-管理**普通 AutoDL 容器实例**的 MCP 服务 + 跨 agent 插件包：开机（含无卡模式）、关机、查询实例与后台开机任务状态。缺货时在后台按指数退避自动重试，不用你盯着。
+管理**普通 AutoDL 容器实例**的 MCP 服务 + [Antigravity](https://antigravity.google/) 插件：开机（含无卡模式）、关机、查询实例与后台开机任务状态。缺货时在后台按指数退避自动重试，不用你盯着。
 
 不适用于 AutoDL Pro（专业版）。
 
-仓库根目录本身就是插件根目录，一份技能（`skills/autodl/SKILL.md`）被所有 agent 共用。
+仓库根目录本身就是插件根目录，装进 Antigravity 一次拿到技能（`skills/autodl/SKILL.md`）和 MCP 服务（`mcp.json`）。
 
-## 支持哪些 agent
+## 只支持 Antigravity
 
-| Agent | 走的格式 | 安装方式 |
-| --- | --- | --- |
-| Antigravity CLI / IDE | Agent Plugins v1.0.0（`plugin.json` + `mcp_config.json` + `skills/`） | `agy plugin install <本仓库>` |
-| Claude Code | 私有格式（`.claude-plugin/` + `.mcp.json`） | `/plugin install autodl-mcp --marketplace Long-Holiday/autodl-mcp` |
-| Cursor | 私有格式（`.cursor-plugin/`） | 应用内 `/add-plugin`，MCP 写进 `.cursor/mcp.json` |
-| Codex CLI、VS Code / Copilot、Kiro、Qwen Code 等 | 同一份 Agent Plugins v1.0.0 格式 | 各家插件生态的安装命令 |
-| 其余客户端（Windsurf、Cline、Roo、Zed、opencode、Continue…） | 通用 `mcpServers` 片段 | `autodl-mcp-install --generic` |
+插件清单只提供一份 Agent Plugins v1.0.0 标准格式（`plugin.json` + `mcp.json` + `skills/`），安装入口只有 `agy`。仓库里**没有**别的 agent 的插件格式或 MCP 配置文件——不打算支持，也不要往这里加。
 
-详细的每个生态的步骤见 [INSTALL.md](INSTALL.md)。
+需要别的形态（比如手写一份 `mcpServers` 片段）时，照着 [mcp-config.example.json](mcp-config.example.json) 自己写，服务本身是标准的 stdio MCP 服务。
 
 ## 快速开始
 
@@ -24,37 +18,14 @@
 git clone https://github.com/Long-Holiday/autodl-mcp
 cd autodl-mcp
 
-# 自动装进本机检测到的 agent（不写 token）
-uv run autodl-mcp-install --list
-uv run autodl-mcp-install --agent antigravity --agent claude
-
-# 其它客户端：打印可直接粘贴的配置片段
-uv run autodl-mcp-install --generic --format json
+uv run autodl-mcp-install --list        # 看本机 agy 装在哪、什么版本
+uv run autodl-mcp-install               # 装进 Antigravity（不写 token）
+uv run autodl-mcp-install --dry-run     # 只看将要执行的命令
 ```
 
-`--dry-run` 只打印将要执行的命令和将要写入的内容。
+`--from-git` 用远端仓库装，不依赖本地检出；`--source <路径或 git URL>` 指定别的安装源。
 
-## Token 怎么给
-
-**仓库和插件清单里不存任何密钥。** 服务从环境变量 `AUTODL_TOKEN` 读取，需要你自己在 agent 的 MCP 配置里设置：
-
-```bash
-export AUTODL_TOKEN='控制台登录 Token 原文（不要加 Bearer 前缀）'
-```
-
-- Token 从浏览器 DevTools → Network → 任意实例请求的 `Authorization` 头里取原文。
-- 从 shell 启动的 agent（Claude Code、agy CLI、Codex…) 会继承这个环境变量，设一次就够。
-- 从桌面图标启动的 GUI 应用可能不继承 shell 环境，此时在该客户端的 MCP 配置里给 `autodl` 服务加 `"env": {"AUTODL_TOKEN": "…"}`（见 INSTALL.md 的通用片段）。
-
-设置完自检：
-
-```bash
-uv run autodl-mcp --check
-```
-
-自检只验证配置能否加载，不访问网络；Token 是否有效要等第一次真实请求才能确认。
-
-## 提供的工具
+装完在 Antigravity 里应该能看到 `autodl` 服务的这些工具：
 
 | 工具 | 作用 |
 | --- | --- |
@@ -66,6 +37,26 @@ uv run autodl-mcp --check
 | `cancel_job` | 只取消后续尝试，不会关机 |
 
 配套的技能文件会告诉 agent：开机前要先确认（会计费）、不要在 `confirming` 阶段重复发起、`cancel_job` 不等于关机、不同 `error.kind` 分别该怎么处理。
+
+## Token 怎么给
+
+**仓库和插件清单里不存任何密钥。** 服务从环境变量 `AUTODL_TOKEN` 读取，需要你自己设置：
+
+```bash
+export AUTODL_TOKEN='控制台登录 Token 原文（不要加 Bearer 前缀）'
+```
+
+- Token 从浏览器 DevTools → Network → 任意实例请求的 `Authorization` 头里取原文。
+- 从终端启动的 `agy` 会继承这个环境变量，写进 `~/.zshrc` 或 `~/.bashrc` 设一次就够。
+- 从桌面图标启动的 GUI 应用可能不继承 shell 环境，这时在它的 MCP 配置里给 `autodl` 服务加 `"env": {"AUTODL_TOKEN": "…"}`（见 [mcp-config.example.json](mcp-config.example.json)）。
+
+设置完自检：
+
+```bash
+uv run autodl-mcp --check
+```
+
+自检只验证配置能否加载，不访问网络；Token 是否有效要等第一次真实请求才能确认。
 
 ## 配置
 
@@ -84,11 +75,14 @@ uv run autodl-mcp --check
 
 用 `AUTODL_CONFIG=/path/to/config.yaml` 可以指向别处的配置文件。
 
+详细的安装、排查与卸载步骤见 [INSTALL.md](INSTALL.md)。
+
 ## 开发
 
 ```bash
 uv run pytest -q
 uv run ruff check .
+agy plugin validate .
 ```
 
 仓库约定见 [AGENTS.md](AGENTS.md)。
