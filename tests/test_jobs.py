@@ -548,8 +548,10 @@ async def test_wait_timeout_and_cancelled_waiter_do_not_cancel_job():
     await client.start_entered.wait()
     job_id = job["job_id"]
     before = jobs.get(job_id)
-    assert await jobs.wait(job_id, 0) == before
-    assert await jobs.wait(job_id, 0.001) == before
+    for timeout in (0, 0.001):
+        current = await jobs.wait(job_id, timeout)
+        assert current.pop("elapsed_seconds") >= before["elapsed_seconds"]
+        assert current == {k: v for k, v in before.items() if k != "elapsed_seconds"}
     waiter = asyncio.create_task(jobs.wait(job_id))
     other = asyncio.create_task(jobs.wait(job_id))
     # Schedule a turn so both waiters enter asyncio.wait before cancelling one.
@@ -615,3 +617,288 @@ async def test_wait_missing_id():
     jobs = Jobs(FakeClient())
     with pytest.raises(ValueError, match="当前服务进程"):
         await jobs.wait("missing")
+
+
+async def test_capacity_notification_wakes_all_waiters_without_cancelling_job():
+    client = FakeClient(retry_interval=60, retry_max_interval=60)
+    client.capacity_failures = 100
+    client.hold_start = asyncio.Event()
+    jobs = Jobs(client)
+    job = await jobs.start("target")
+    await client.start_entered.wait()
+    waiters = [asyncio.create_task(jobs.wait(job["job_id"], 120)) for _ in range(3)]
+    await asyncio.sleep(0)
+    client.hold_start.set()
+    results = await asyncio.wait_for(asyncio.gather(*waiters), 1)
+    for result in results:
+        assert result["phase"] == "waiting_capacity"
+        assert result["attempts"] == 1
+        assert result["next_retry_at"]
+        assert result["elapsed_seconds"] >= 0
+    assert client.starts == 1
+    assert not jobs.jobs[job["job_id"]].task.done()
+    assert (await asyncio.wait_for(jobs.wait(job["job_id"], 120), 1))["phase"] == "waiting_capacity"
+    terminal_waiter = asyncio.create_task(jobs.wait(job["job_id"], 120, return_on_capacity=False))
+    await asyncio.sleep(0)
+    assert not terminal_waiter.done()
+    await jobs.cancel(job["job_id"])
+    terminal = await terminal_waiter
+    assert terminal["phase"] == "cancelled"
+    assert await jobs.wait(job["job_id"]) == terminal
+    await jobs.close()
+
+
+@pytest.mark.parametrize("target", ["gpu", "non_gpu"])
+async def test_switch_modes_order_and_identity(target):
+    client = FakeClient()
+    client.state = "running"
+    client.start_mode = "non_gpu" if target == "gpu" else "gpu"
+    events = []
+    status, off, on = client.status, client.power_off, client.power_on
+
+    async def observe(uuid, **kwargs):
+        result = await status(uuid, **kwargs)
+        events.append(result["status"])
+        return result
+
+    async def shutdown(uuid):
+        events.append("off")
+        await off(uuid)
+
+    async def startup(uuid, **kwargs):
+        events.append("on")
+        assert "shutdown" in events[events.index("off") + 1 :]
+        await on(uuid, **kwargs)
+
+    client.status, client.power_off, client.power_on = observe, shutdown, startup
+    jobs = Jobs(client)
+    job = await jobs.switch("target", target)
+    assert (await jobs.switch("target", target))["job_id"] == job["job_id"]
+    with pytest.raises(ValueError):
+        await jobs.start("target", no_gpu=target == "non_gpu")
+    with pytest.raises(ValueError):
+        await jobs.switch("target", "non_gpu" if target == "gpu" else "gpu")
+    result = await completed(jobs, job)
+    assert result["phase"] == "succeeded"
+    assert result["operation"] == "switch"
+    assert result["target_mode"] == target
+    assert client.stops == client.starts == 1
+    assert not jobs.shutdown_pending
+    await jobs.close()
+
+
+@pytest.mark.parametrize("target", ["gpu", "non_gpu"])
+@pytest.mark.parametrize("state", ["running", "shutdown", "shutting_down"])
+async def test_switch_noop_or_already_stopping(target, state):
+    client = FakeClient()
+    client.start_mode = target
+    client.state = state
+    original_status = client.status
+    reads = 0
+
+    async def status(uuid, **kwargs):
+        nonlocal reads
+        reads += 1
+        if state == "shutting_down" and reads > 1 and client.starts == 0:
+            client.state = "shutdown"
+        return await original_status(uuid, **kwargs)
+
+    client.status = status
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.switch("target", target))
+    assert result["phase"] == "succeeded"
+    assert client.stops == 0
+    assert client.starts == (0 if state == "running" else 1)
+    await jobs.close()
+
+
+async def test_switch_rejects_ineligible_or_unknown_state_before_shutdown():
+    for state, charge_type in [("running", "subscription"), ("unknown", "payg")]:
+        client = FakeClient()
+        client.state, client.charge_type = state, charge_type
+        jobs = Jobs(client)
+        result = await completed(jobs, await jobs.switch("target", "non_gpu"))
+        assert result["phase"] == "failed"
+        assert result["error"]["kind"] == "state"
+        assert client.stops == client.starts == 0
+        await jobs.close()
+    with pytest.raises(ValueError, match="target_mode"):
+        await Jobs(FakeClient()).switch("target", "invalid")
+
+
+@pytest.mark.parametrize("confirms", [False, True])
+async def test_switch_ambiguous_shutdown_observes_without_resending(clock, confirms):
+    client = FakeClient(stop_timeout=1, poll_interval=0.1)
+    client.state = "running"
+
+    async def power_off(uuid):
+        client.stops += 1
+        if confirms:
+            client.state = "shutdown"
+        raise AutoDLError("network", "请求超时", ambiguous=True)
+
+    client.power_off = power_off
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.switch("target", "non_gpu"))
+    assert client.stops == 1
+    assert client.starts == (1 if confirms else 0)
+    assert result["phase"] == ("succeeded" if confirms else "failed")
+    if not confirms:
+        assert result["error"]["kind"] == "uncertain"
+        assert result["error"]["ambiguous"]
+        assert "target" in jobs.shutdown_pending
+    await jobs.close()
+
+
+async def test_switch_shutdown_timeout_never_starts(clock):
+    client = FakeClient(stop_timeout=1, poll_interval=0.1)
+    client.state = "running"
+
+    async def power_off(uuid):
+        client.stops += 1
+        client.state = "shutting_down"
+
+    client.power_off = power_off
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.switch("target", "non_gpu"))
+    assert result["error"]["kind"] == "timeout"
+    assert client.stops == 1
+    assert client.starts == 0
+    with pytest.raises(ValueError, match="关机尚未确认"):
+        await jobs.start("target")
+    await jobs.close()
+
+
+@pytest.mark.parametrize("action", ["cancel", "stop", "close"])
+async def test_switch_cancel_during_shutdown_prevents_restart(action):
+    client = FakeClient()
+    client.state = "running"
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def power_off(uuid):
+        client.stops += 1
+        client.state = "shutting_down"
+        entered.set()
+        await release.wait()
+
+    client.power_off = power_off
+    jobs = Jobs(client)
+    job = await jobs.switch("target", "non_gpu")
+    await entered.wait()
+    if action == "cancel":
+        await jobs.cancel(job["job_id"])
+    elif action == "stop":
+        await jobs.stop("target")
+    else:
+        await jobs.close()
+    release.set()
+    assert jobs.get(job["job_id"])["phase"] == "cancelled"
+    assert client.starts == 0
+    assert client.stops == 1
+    assert "target" in jobs.shutdown_pending
+    await jobs.close()
+
+
+async def test_switch_gpu_capacity_reuses_switch_job():
+    client = FakeClient(retry_interval=60, retry_max_interval=60)
+    client.state, client.start_mode = "running", "non_gpu"
+    client.capacity_failures = 1
+    jobs = Jobs(client)
+    job = await jobs.switch("target", "gpu")
+    result = await asyncio.wait_for(jobs.wait(job["job_id"], 120), 1)
+    assert result["phase"] == "waiting_capacity"
+    assert result["job_id"] == job["job_id"]
+    assert result["operation"] == "switch"
+    assert client.stops == client.starts == 1
+    await jobs.stop("target")
+    assert jobs.get(job["job_id"])["phase"] == "cancelled"
+    assert client.starts == 1
+    await jobs.close()
+
+
+@pytest.mark.parametrize("during", ["mutation", "observation"])
+async def test_switch_late_ambiguous_shutdown_preserves_uncertain_result(clock, during):
+    client = FakeClient(stop_timeout=1)
+    client.state = "running"
+    original_status = client.status
+    reads = 0
+
+    async def status(uuid, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads > 1 and during == "observation":
+            clock.now += 2
+            raise AutoDLError("network", "读取超时")
+        return await original_status(uuid, **kwargs)
+
+    async def power_off(uuid):
+        client.stops += 1
+        if during == "mutation":
+            clock.now += 2
+        raise AutoDLError("network", "关机响应超时", ambiguous=True)
+
+    client.status, client.power_off = status, power_off
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.switch("target", "non_gpu"))
+    assert result["error"]["kind"] == "uncertain"
+    assert result["error"]["ambiguous"]
+    assert client.starts == 0
+    assert client.stops == 1
+    await jobs.close()
+
+
+async def test_switch_shutdown_read_retries_honor_retry_after(clock):
+    client = FakeClient(stop_timeout=10)
+    client.state = "running"
+    original_status = client.status
+    reads = 0
+
+    async def status(uuid, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise AutoDLError("rate_limit", "限流", retry_after=2)
+        return await original_status(uuid, **kwargs)
+
+    client.status = status
+    jobs = Jobs(client)
+    result = await completed(jobs, await jobs.switch("target", "non_gpu"))
+    assert result["phase"] == "succeeded"
+    assert clock.sleeps[0] == 2
+    assert client.stops == client.starts == 1
+    await jobs.close()
+
+
+@pytest.mark.parametrize("no_gpu", [False, True])
+async def test_switch_cancel_before_run_never_mutates(no_gpu):
+    client = FakeClient()
+    client.state = "running"
+    jobs = Jobs(client)
+    job = await jobs.switch("target", "non_gpu" if no_gpu else "gpu")
+    result = await jobs.cancel(job["job_id"])
+    assert result["phase"] == "cancelled"
+    assert client.starts == client.stops == 0
+    assert result["elapsed_seconds"] >= 0
+    await jobs.close()
+
+
+async def test_switch_stop_during_start_confirmation_prevents_future_start():
+    client = FakeClient()
+    client.state = "running"
+    client.auto_running = False
+    jobs = Jobs(client)
+    job = await jobs.switch("target", "non_gpu")
+    await client.start_entered.wait()
+    assert jobs.get(job["job_id"])["phase"] == "confirming"
+    await jobs.stop("target")
+    assert jobs.get(job["job_id"])["phase"] == "cancelled"
+    assert client.starts == 1
+    assert client.stops == 2
+    assert client.state == "shutdown"
+    await jobs.close()
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+async def test_wait_rejects_nonboolean_capacity_flag(value):
+    with pytest.raises(ValueError, match="return_on_capacity"):
+        await Jobs(FakeClient()).wait("missing", return_on_capacity=value)

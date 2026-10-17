@@ -1,7 +1,7 @@
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import httpx2 as httpx
 from mcp.server import MCPServer
@@ -37,7 +37,8 @@ def create_server(
         instructions=(
             "管理普通 AutoDL 容器实例，不适用于 Pro。开机会计费，关机会中断正在运行的任务。"
             "普通开机任务在后台等待空闲 GPU，无卡模式开机不申请 GPU，仅支持按量计费实例。"
-            "通过 wait_for_job 等待任务、job_status 即时查询、cancel_job 取消。"
+            "通过 wait_for_job 短等待并汇报缺货进度、job_status 即时查询、cancel_job 取消。"
+            "多实例查询用 list_instances；切换模式用 switch_mode，必须先确认中断和计费。"
             "取消或 MCP 服务退出不会自动关机；任务不跨服务重启恢复。"
         ),
     )
@@ -82,7 +83,33 @@ def create_server(
         return await jobs().client.status(instance_uuid)
 
     @server.tool(
-        description="查询当前进程中的开机任务、尝试次数、重试时间和错误。",
+        description=(
+            "批量查询 1–100 个实例 UUID 的状态和硬件规格，共享一次列表分页。"
+            "返回 instances 与逐项 errors；价格来源未验证时 price 为 null，不代表免费。"
+            "不会返回密码或 SSH 凭证。"
+        ),
+        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
+    )
+    async def list_instances(
+        instance_uuids: Annotated[list[str], Field(min_length=1, max_length=100)],
+    ) -> dict[str, Any]:
+        return await jobs().client.list_instances(instance_uuids)
+
+    @server.tool(
+        description=(
+            "切换 GPU/无卡模式，立即返回后台任务 ID：关机、确认关机、按目标模式重新开机。"
+            "会中断运行任务，重新开机会计费；执行前必须确认。无卡目标仅支持按量计费。"
+            "不是可回滚事务；失败或取消可能停在关机状态，不自动恢复。任务不跨服务重启恢复。"
+        ),
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+    )
+    async def switch_mode(
+        instance_uuid: str, target_mode: Literal["gpu", "non_gpu"] = "gpu"
+    ) -> dict[str, Any]:
+        return await jobs().switch(instance_uuid, target_mode)
+
+    @server.tool(
+        description="查询当前进程中的开机/切换任务、尝试次数、累计耗时、重试时间和错误。",
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
     )
     async def job_status(job_id: str) -> dict[str, Any]:
@@ -90,19 +117,23 @@ def create_server(
 
     @server.tool(
         description=(
-            "只读等待当前进程的开机任务结束，或等待超时后返回当前 job_status 快照。"
-            "timeout_seconds 为 0–300 秒（默认 300，0 立即返回）；活动 phase 表示尚未结束。"
+            "只读等待当前进程任务结束、缺货或超时后返回快照；默认缺货立即返回。"
+            "timeout_seconds 为 0–300 秒（默认 15，0 立即返回）。"
+            "return_on_capacity=False 可等待穿过缺货阶段；活动 phase 表示尚未结束。"
+            "缺货返回后先汇报 attempts/elapsed_seconds/next_retry_at，不要紧密重复查询。"
             "本次等待超时或断开不会取消后台开机任务；任务不跨服务重启恢复。"
         ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
     )
     async def wait_for_job(
-        job_id: str, timeout_seconds: Annotated[float, Field(ge=0, le=300, strict=True)] = 300
+        job_id: str,
+        timeout_seconds: Annotated[float, Field(ge=0, le=300, strict=True)] = 15,
+        return_on_capacity: Annotated[bool, Field(strict=True)] = True,
     ) -> dict[str, Any]:
-        return await jobs().wait(job_id, timeout_seconds)
+        return await jobs().wait(job_id, timeout_seconds, return_on_capacity=return_on_capacity)
 
     @server.tool(
-        description="取消开机任务的后续尝试，不撤销已接受的开机请求，不自动关机。",
+        description="取消开机/切换任务的后续步骤，不撤销已接受的电源请求，不自动关机或恢复。",
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
     )
     async def cancel_job(job_id: str) -> dict[str, Any]:

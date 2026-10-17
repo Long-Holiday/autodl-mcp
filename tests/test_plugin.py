@@ -141,6 +141,7 @@ def test_skill_frontmatter_and_safety():
         allowed = allowed.split(",")
     assert {tool.strip() for tool in allowed} == {
         "mcp__autodl__instance_status",
+        "mcp__autodl__list_instances",
         "mcp__autodl__job_status",
         "mcp__autodl__wait_for_job",
     }

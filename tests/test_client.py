@@ -506,3 +506,160 @@ async def test_snapshot_transport_error_is_safe():
         assert "private-credential" not in str(exc.value)
     finally:
         await client.close()
+
+
+async def test_batch_shared_pagination_order_partial_errors_and_redaction():
+    pages, snapshots = [], []
+
+    def handler(request):
+        if request.method == "GET":
+            uuid = request.url.params["instance_uuid"]
+            snapshots.append(uuid)
+            if uuid == "bad-hardware":
+                return httpx.Response(200, json={"code": "Error", "msg": "private-secret"})
+            return httpx.Response(
+                200,
+                json={
+                    "code": "Success",
+                    "data": {
+                        "snapshot_gpu_alias_name": "RTX 3090",
+                        "machine_info_snapshot": {
+                            "gpu_type": {"memory": 24 * 1024**3},
+                            "cpu_used": 8,
+                        },
+                        "root_password": "private-secret",
+                    },
+                },
+            )
+        page = json.loads(request.content)["page_index"]
+        pages.append(page)
+        # Server caps pages at one row, irrespective of requested page_size.
+        uuid = ["first", "other", "bad-hardware"][page - 1]
+        return httpx.Response(
+            200,
+            json={
+                "code": "Success",
+                "data": {
+                    "list": [
+                        {
+                            "uuid": uuid,
+                            "status": "running",
+                            "price": "unverified",
+                            "ssh_command": "private-secret",
+                        }
+                    ],
+                    "result_total": 3,
+                },
+            },
+        )
+
+    client = AutoDLClient(Settings(token="test"), httpx.MockTransport(handler))
+    try:
+        result = await client.list_instances(["bad-hardware", "first", "first", "missing"])
+        assert pages == [1, 2, 3]
+        assert snapshots == ["bad-hardware", "first"]
+        assert [r["instance_uuid"] for r in result["instances"]] == ["bad-hardware", "first"]
+        assert [e["error"]["kind"] for e in result["errors"]] == ["business", "not_found"]
+        assert result["instances"][0]["status"] == "running"
+        assert result["instances"][0]["gpu_name"] is None
+        assert result["instances"][1]["gpu_memory_gb"] == 24
+        assert all(r["price"] is None for r in result["instances"])
+        assert all(r["price_unavailable_reason"] for r in result["instances"])
+        assert "private-secret" not in str(result)
+        assert "unverified" not in str(result)
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    "uuids",
+    [[], ["allowed", "other"], ["allowed", "../bad"], ["allowed", 1], ["allowed"] * 101, "allowed"],
+)
+async def test_batch_prevalidation_never_accesses_network(uuids):
+    def handler(request):
+        pytest.fail("Invalid batch must not access network")
+
+    client = AutoDLClient(
+        Settings(token="test", instance_allowlist=frozenset({"allowed"})),
+        httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(ValueError):
+            await client.list_instances(uuids)
+    finally:
+        await client.close()
+
+
+async def test_batch_hardware_concurrency_is_bounded():
+    import asyncio
+
+    active, peak = 0, 0
+    release = asyncio.Event()
+    full = asyncio.Event()
+    uuids = [f"target-{n}" for n in range(12)]
+
+    async def handler(request):
+        nonlocal active, peak
+        if request.method != "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "code": "Success",
+                    "data": {
+                        "list": [{"uuid": u, "status": "shutdown"} for u in uuids],
+                        "result_total": len(uuids),
+                    },
+                },
+            )
+        active += 1
+        peak = max(peak, active)
+        if active == 5:
+            full.set()
+        await release.wait()
+        active -= 1
+        return httpx.Response(200, json={"code": "Success", "data": {}})
+
+    client = AutoDLClient(Settings(token="test"), httpx.MockTransport(handler))
+    try:
+        task = asyncio.create_task(client.list_instances(uuids))
+        await asyncio.wait_for(full.wait(), 1)
+        assert peak == 5
+        release.set()
+        result = await task
+        assert len(result["instances"]) == 12
+        assert peak == 5
+    finally:
+        release.set()
+        await client.close()
+
+
+async def test_batch_does_not_return_allowlist_excluded_rows():
+    def handler(request):
+        if request.method == "GET":
+            assert request.url.params["instance_uuid"] == "allowed"
+            return httpx.Response(200, json={"code": "Success", "data": {}})
+        return httpx.Response(
+            200,
+            json={
+                "code": "Success",
+                "data": {
+                    "list": [
+                        {"uuid": "excluded", "status": "running"},
+                        {"uuid": ["malformed"], "status": "running"},
+                        {"uuid": "allowed", "status": "shutdown"},
+                    ],
+                    "result_total": 3,
+                },
+            },
+        )
+
+    client = AutoDLClient(
+        Settings(token="test", instance_allowlist=frozenset({"allowed"})),
+        httpx.MockTransport(handler),
+    )
+    try:
+        result = await client.list_instances(["allowed"])
+        assert len(result["instances"]) == 1
+        assert "excluded" not in str(result)
+    finally:
+        await client.close()

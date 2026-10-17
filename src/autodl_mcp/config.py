@@ -20,6 +20,7 @@ _NUMBER_FIELDS = (
     "transient_retry_max_interval",
     "poll_interval",
     "start_timeout",
+    "stop_timeout",
     "request_timeout",
     "max_wait_seconds",
 )
@@ -40,6 +41,7 @@ class Settings:
     transient_retry_max_interval: float = 900
     max_wait_seconds: float = 0
     poll_interval: float = 5
+    stop_timeout: float = 600
     start_timeout: float = 600
     request_timeout: float = 30
 

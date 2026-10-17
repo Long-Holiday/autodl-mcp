@@ -30,11 +30,13 @@ uv run autodl-mcp-install --dry-run     # 只看将要执行的命令
 | 工具 | 作用 |
 | --- | --- |
 | `instance_status` | 查实例状态及 GPU 型号、单卡显存、分配的 CPU 核心数（不返回凭证） |
+| `list_instances` | 批量查询 1–100 个 UUID 的状态和硬件，共享分页；价格未验证时明确返回未知 |
+| `switch_mode` | 一个后台任务完成关机、确认关机、按目标模式开机；会中断工作且重新计费 |
 | `power_on` | 申请 GPU 开机，**立即返回 `job_id`**，缺货后台重试 |
 | `power_on_no_gpu` | 无卡模式开机（仅按量计费实例） |
 | `power_off` | 关机，**会中断实例上正在运行的任务** |
 | `job_status` | 查后台开机任务的 phase / 重试时间 / 错误 |
-| `wait_for_job` | 长轮询等待任务完成（默认最多 300 秒），超时返回当前状态，不取消任务 |
+| `wait_for_job` | 短等待任务完成（默认最多 15 秒），缺货立即返回进度；不取消任务 |
 | `cancel_job` | 只取消后续尝试，不会关机 |
 
 配套的技能文件会告诉 agent：开机前要先确认（会计费）、不要在 `confirming` 阶段重复发起、`cancel_job` 不等于关机、不同 `error.kind` 分别该怎么处理。
@@ -46,12 +48,42 @@ uv run autodl-mcp-install --dry-run     # 只看将要执行的命令
 `gpu_memory_gb` 是**单卡**显存，按 1024³ 字节换算（与控制台 GB 显示一致）；
 `cpu_cores` 是分配的 vCPU 数，不是宿主机总核数。无卡模式下返回的 GPU 配置不代表当前已挂载 GPU。
 
-开机得到 `job_id` 后，可调用 `wait_for_job(job_id, timeout_seconds=300)`，
-任务进入 `succeeded` / `failed` / `cancelled` 时立即返回，否则等待到期返回当前快照。
-`timeout_seconds` 范围为 0–300 秒，0 表示立即查询；若返回活动 `phase`，说明任务尚未结束，
-可继续长轮询。等待超时或中断不会取消后台任务，也不会增加上游查询或开机请求。
-仍可用 `job_status` 即时查看进度。宿主工具调用超时若短于 300 秒，请选用更短的等待时间。
+开机或切换得到 `job_id` 后，可调用 `wait_for_job(job_id)`：默认最多等 **15 秒**，
+任务结束或发现缺货（`waiting_capacity`）时立即返回。即使显式传入 `timeout_seconds=120`，
+默认也不会在已知缺货时继续静默等待。快照包含 `attempts`、`elapsed_seconds`、`next_retry_at`。
+`elapsed_seconds` 是任务累计耗时（终态固定），**不是平台承诺的排队时长或排位**。
+
+收到缺货快照后，先向用户报告尝试次数、已等待时间和下次重试时间，不要紧密重复调用。
+需要继续短等待时用 `wait_for_job(job_id, timeout_seconds=15, return_on_capacity=False)`；
+显式长等待仍可使用 `timeout_seconds=120, return_on_capacity=False`。
+秒数范围为 0–300，0 立即返回；活动 phase 表示尚未完成。等待超时或中断不会取消后台任务，
+也不会增加上游查询或开机请求。即时进度仍可用 `job_status` 查询。
 任务只保存在当前 MCP 进程中，不跨服务重启恢复。
+
+### 批量查询
+
+`list_instances(instance_uuids=["uuid-a", "uuid-b"])` 共用一次列表分页，再以最多 5 路并发读取硬件快照。
+1–100 个 UUID 全部通过格式/白名单校验后才发请求；重复 UUID 去重，结果按输入顺序排列。
+返回 `instances` 与 `errors`：单个实例找不到或硬件获取失败不会抹掉其他成功结果；
+硬件失败时保留状态，规格为 `null`，错误在 `errors` 中。列表整体鉴权/协议错误则整次调用失败。
+
+**价格尚未提供准确报价**：现有接口资料未验证价格字段、币种及计费单位，
+所以每项返回 `price: null` 和 `price_unavailable_reason`，**不代表免费**。
+接入真实报价需要经过验证的接口资料或脱敏响应样例，不根据 `charge_type` 猜金额。
+
+### 无卡 / GPU 模式切换
+
+确认中断任务与重新计费后，调用 `switch_mode(instance_uuid, target_mode="gpu")`，
+或 `target_mode="non_gpu"`（无卡，仅按量计费）。工具立即返回 `job_id`，后台顺序完成：
+检查 → 关机 → 确认关机 → 按目标模式开机 → 确认运行；GPU 缺货沿用自动退避。
+已按目标模式运行时不关机；已经关机则直接开机；已经关机中则只等待。
+同一实例相同切换复用活动任务，其他活动操作冲突需先取消并确认实例状态。
+
+这是**编排而非可回滚事务**。失败、取消或服务退出可能留下运行中、关机中或已关机的实例，
+不会自动回滚；取消不会撤销已经接受的电源请求。
+`power_off` 会先取消切换，防止其后续自动拉起。
+`stopping` 表示正在请求/确认关机，未观察到关机状态绝不开机。
+关机确认受 `stop_timeout` 限制，超时或结果不确定时停止切换，请查询实际状态再决定。
 
 ## Token 怎么给
 
@@ -85,6 +117,7 @@ uv run autodl-mcp --check
 | `transient_retry_interval` / `transient_retry_max_interval` | `60` / `900` | 网络类错误的退避起止间隔（秒） |
 | `max_wait_seconds` | `0` | 单次开机等待上限，`0` 表示不限时 |
 | `poll_interval` | `5` | 开机状态轮询间隔（秒） |
+| `stop_timeout` | `600` | 模式切换的关机确认上限（秒），可用 `AUTODL_STOP_TIMEOUT` 覆盖 |
 | `start_timeout` | `600` | 单次开机请求的确认上限（秒） |
 | `request_timeout` | `30` | 单次 HTTP 请求超时（秒） |
 

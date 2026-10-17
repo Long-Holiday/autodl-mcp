@@ -29,6 +29,9 @@ max_wait_seconds: 0
 # 开机状态轮询间隔（秒）。
 poll_interval: 5
 
+# 模式切换时关机确认的等待上限（秒）。
+stop_timeout: 600
+
 # 单次开机请求的等待上限（秒）。
 start_timeout: 600
 

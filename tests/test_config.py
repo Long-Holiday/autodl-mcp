@@ -164,3 +164,18 @@ def test_missing_token(tmp_path, monkeypatch):
     monkeypatch.delenv("AUTODL_TOKEN", raising=False)
     with pytest.raises(ValueError, match="Token"):
         Settings.load()
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_invalid_stop_timeout(value):
+    with pytest.raises(ValueError, match="stop_timeout"):
+        Settings(token="test", stop_timeout=value)
+
+
+async def test_stop_timeout_file_and_env(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AUTODL_TOKEN", "test")
+    (tmp_path / "config.yaml").write_text("stop_timeout: 17\n")
+    assert Settings.load().stop_timeout == 17
+    monkeypatch.setenv("AUTODL_STOP_TIMEOUT", "23")
+    assert Settings.load().stop_timeout == 23

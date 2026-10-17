@@ -1,3 +1,4 @@
+import asyncio
 import math
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -172,8 +173,8 @@ class AutoDLClient:
             else None,
         }
 
-    async def status(self, instance_uuid: str, *, include_hardware: bool = True) -> dict[str, Any]:
-        self.settings.validate_uuid(instance_uuid)
+    async def _statuses(self, wanted: set[str]) -> dict[str, dict[str, Any]]:
+        found = {}
         page = 1
         observed = 0
         while True:
@@ -200,7 +201,8 @@ class AutoDLClient:
             for row in rows:
                 if not isinstance(row, dict):
                     raise AutoDLError("protocol", "AutoDL 实例记录结构发生变化")
-                if row.get("uuid") == instance_uuid:
+                if isinstance(row.get("uuid"), str) and row["uuid"] in wanted:
+                    instance_uuid = row["uuid"]
                     if not isinstance(row.get("status"), str) or not row["status"]:
                         raise AutoDLError("protocol", "AutoDL 实例缺少有效状态")
                     result = {
@@ -220,15 +222,58 @@ class AutoDLClient:
                         else None,
                         "observed_at": datetime.now(UTC).isoformat(),
                     }
-                    if include_hardware:
-                        result.update(await self._hardware(instance_uuid))
-                    return result
+                    found[instance_uuid] = result
+            if wanted <= found.keys():
+                return found
             observed += len(rows)
             if observed >= data["result_total"] or not rows:
-                raise AutoDLError("not_found", "未找到指定 UUID 的实例")
+                return found
             page += 1
             if page > 1000:
                 raise AutoDLError("protocol", "实例列表分页超出安全上限")
+
+    async def status(self, instance_uuid: str, *, include_hardware: bool = True) -> dict[str, Any]:
+        self.settings.validate_uuid(instance_uuid)
+        found = await self._statuses({instance_uuid})
+        if instance_uuid not in found:
+            raise AutoDLError("not_found", "未找到指定 UUID 的实例")
+        result = found[instance_uuid]
+        if include_hardware:
+            result.update(await self._hardware(instance_uuid))
+        return result
+
+    async def list_instances(self, instance_uuids: list[str]) -> dict[str, Any]:
+        if not isinstance(instance_uuids, list) or not 1 <= len(instance_uuids) <= 100:
+            raise ValueError("instance_uuids 必须包含 1 到 100 个 UUID")
+        for uuid in instance_uuids:
+            if not isinstance(uuid, str):
+                raise ValueError("instance_uuid 必须是字符串")
+            self.settings.validate_uuid(uuid)
+        uuids = list(dict.fromkeys(instance_uuids))
+        found = await self._statuses(set(uuids))
+        semaphore = asyncio.Semaphore(5)
+
+        async def enrich(uuid: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+            if uuid not in found:
+                return None, {
+                    "instance_uuid": uuid,
+                    "error": AutoDLError("not_found", "未找到指定 UUID 的实例").as_dict(),
+                }
+            result = found[uuid]
+            result.update(price=None, price_unavailable_reason="价格字段及计费单位尚未验证")
+            try:
+                async with semaphore:
+                    result.update(await self._hardware(uuid))
+            except AutoDLError as exc:
+                result.update(gpu_name=None, gpu_memory_gb=None, cpu_cores=None)
+                return result, {"instance_uuid": uuid, "error": exc.as_dict()}
+            return result, None
+
+        results = await asyncio.gather(*(enrich(uuid) for uuid in uuids))
+        return {
+            "instances": [row for row, _ in results if row is not None],
+            "errors": [error for _, error in results if error is not None],
+        }
 
     async def power_on(self, instance_uuid: str, *, no_gpu: bool = False) -> None:
         self.settings.validate_uuid(instance_uuid)

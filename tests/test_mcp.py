@@ -83,6 +83,8 @@ async def test_stdio_protocol_and_all_tools():
             "power_on_no_gpu",
             "power_off",
             "instance_status",
+            "list_instances",
+            "switch_mode",
             "job_status",
             "wait_for_job",
             "cancel_job",
@@ -92,7 +94,7 @@ async def test_stdio_protocol_and_all_tools():
         assert wait_tool.annotations.read_only_hint
         assert not wait_tool.annotations.destructive_hint
         timeout_schema = wait_tool.input_schema["properties"]["timeout_seconds"]
-        assert timeout_schema["default"] == 300
+        assert timeout_schema["default"] == 15
         assert timeout_schema["minimum"] == 0
         assert timeout_schema["maximum"] == 300
         status = await session.call_tool("instance_status", {"instance_uuid": "target"})
@@ -102,6 +104,17 @@ async def test_stdio_protocol_and_all_tools():
         assert status.structured_content["gpu_memory_gb"] == 24
         assert status.structured_content["cpu_cores"] == 14
         assert "secret" not in str(status)
+        batch_tool = next(t for t in tools if t.name == "list_instances")
+        assert batch_tool.annotations.read_only_hint
+        switch_tool = next(t for t in tools if t.name == "switch_mode")
+        assert switch_tool.annotations.destructive_hint
+        assert not switch_tool.annotations.read_only_hint
+        assert wait_tool.input_schema["properties"]["return_on_capacity"]["default"] is True
+        batch = await session.call_tool("list_instances", {"instance_uuids": ["target", "waiting"]})
+        assert not batch.is_error
+        assert len(batch.structured_content["instances"]) == 2
+        assert not batch.structured_content["errors"]
+        assert "secret" not in str(batch)
         started = await session.call_tool("power_on", {"instance_uuid": "target"})
         assert not started.is_error
         job_id = started.structured_content["job_id"]
@@ -121,6 +134,14 @@ async def test_stdio_protocol_and_all_tools():
         status = await session.call_tool("instance_status", {"instance_uuid": "target"})
         assert status.structured_content["start_mode"] == "non_gpu"
         assert "secret" not in str(status)
+        switched = await session.call_tool("switch_mode", {"instance_uuid": "target"})
+        assert not switched.is_error
+        switched_job = await session.call_tool(
+            "wait_for_job", {"job_id": switched.structured_content["job_id"]}
+        )
+        assert switched_job.structured_content["phase"] == "succeeded"
+        assert switched_job.structured_content["operation"] == "switch"
+        assert switched_job.structured_content["last_status"] == "running"
         stopped = await session.call_tool("power_off", {"instance_uuid": "target"})
         assert stopped.structured_content["accepted"]
         waiting = await session.call_tool("power_on", {"instance_uuid": "waiting"})
@@ -128,7 +149,7 @@ async def test_stdio_protocol_and_all_tools():
             "wait_for_job",
             {
                 "job_id": waiting.structured_content["job_id"],
-                "timeout_seconds": 0.001,
+                "timeout_seconds": 120,
             },
         )
         assert not pending.is_error
@@ -139,7 +160,11 @@ async def test_stdio_protocol_and_all_tools():
                 "job_id": waiting.structured_content["job_id"],
             },
         )
-        assert immediate.structured_content == pending.structured_content
+        assert (
+            immediate.structured_content["elapsed_seconds"]
+            >= pending.structured_content["elapsed_seconds"]
+        )
+        assert immediate.structured_content["attempts"] == pending.structured_content["attempts"]
         for invalid in (-1, 301, True, "1"):
             invalid_result = await session.call_tool(
                 "wait_for_job",
@@ -170,7 +195,7 @@ async def test_real_entrypoint_discovery_without_remote_requests():
     )
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
-        assert len((await session.list_tools()).tools) == 7
+        assert len((await session.list_tools()).tools) == 9
 
 
 if __name__ == "__main__":
