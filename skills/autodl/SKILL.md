@@ -58,7 +58,7 @@ allowed-tools: mcp__autodl__instance_status, mcp__autodl__list_instances, mcp__a
 | `power_off(instance_uuid)` | 关机，中断实例上的任务 | 破坏性 |
 | `job_status(job_id)` | 查后台开机任务的 `phase` / `attempts` / `error` / `suggested_next_poll_seconds` | 只读 |
 | `wait_for_job(job_id)` | 默认最多 15 秒，缺货/结束/超时返回快照；不取消任务 | 只读 |
-| `cancel_job(job_id)` | 停止开机/切换任务的**后续步骤** | 写 |
+| `cancel_job(job_id)` | 停止开机/切换任务的**后续步骤**，返回取消后的 `resulting_status` | 写 |
 
 ## 硬件配置判读
 
@@ -96,7 +96,7 @@ allowed-tools: mcp__autodl__instance_status, mcp__autodl__list_instances, mcp__a
 | `confirming` | 已发出请求但结果不确定，正在观察实际状态 | 等待；此时**绝不能**再发一次开机 |
 | `succeeded` | 实例已按预期模式运行 | 完成 |
 | `failed` | 出错停止，原因在 `error` 里 | 按下面的错误处置 |
-| `cancelled` | 被取消 | 不撤销已接受的电源请求；先确认实际状态，切换可能停在关机状态 |
+| `cancelled` | 被取消 | 看 `cancel_job` 返回的 `resulting_status`：稳定态可直接用，过渡态或 `null` 再查 `instance_status`；切换可能停在关机状态 |
 
 ## 错误处置
 
@@ -120,18 +120,26 @@ allowed-tools: mcp__autodl__instance_status, mcp__autodl__list_instances, mcp__a
 - 只支持**按量计费**（`charge_type == "payg"`）实例，包年包月会直接报 `state` 错误。
 - `power_on` / `power_on_no_gpu` 不会隐式切换运行中实例的模式。
 - 要切换时，先确认 UUID、**中断运行任务/丢失未保存进度**以及重新开机计费，再调用一次 `switch_mode(instance_uuid, target_mode="gpu" 或 "non_gpu")`；不要手动反复编排电源工具。
-- 切换是单个后台任务，不是可回滚事务；失败或取消可能停在关机状态，不自动恢复。无卡目标会在关机前校验按量计费要求。用同一 job_id 查询/等待/取消。
+- 切换是单个后台任务，不是可回滚事务；失败或取消可能停在关机状态，不自动恢复。无卡目标会在关机前校验按量计费要求。用同一 job_id 查询/等待/取消；`cancel_job` 会返回取消后的物理状态 `resulting_status`。
 - 若要阻止切换后继续开机并关机，用 `power_off`；它会先取消活动切换。
 
 ## 取消任务
 
-`cancel_job(job_id)` 只停止开机/切换任务的**后续步骤**：
+`cancel_job(job_id)` 只停止开机/切换任务的**后续步骤**，并返回取消后立即查询的实例状态：
 
+- `resulting_status` 是取消后的物理状态，`resulting_start_mode` 是当时的启动模式，`resulting_observed_at` 是查询时间。
+- 为 `shutdown`、`running` 等稳定状态时通常可直接据此判断，不必再调 `instance_status`；若取消时仍有已发出、结果未知的电源请求，状态可能随后变化。
+- 为 `starting`、`shutting_down` 等过渡态时，已接受的电源请求仍可能改变状态，需要时再查。
+- 查询失败时 `resulting_status` 为 `null`，原因在 `resulting_status_error`，必须先 `instance_status` 确认。
 - 不会撤销已经发出去的、上游可能已经接受的电源请求；
-- 不会自动关机；
-- 不保证实例状态未改变：已接受的关机/开机会继续生效，切换取消后可能处于关机状态。
+- 不会自动关机，也不自动恢复。
 
-如果用户真正想要的是「停下来并关掉」，顺序是：`cancel_job` → `instance_status` 确认实际状态 → 视情况 `power_off`。
+典型场景：无卡运行 → `switch_mode(target_mode="gpu")` → 已完成关机、在 `waiting_capacity` 等 GPU 时取消。
+实例停在 `shutdown`，`resulting_status` 直接返回 `"shutdown"`；要恢复无卡运行就调用 `power_on_no_gpu`，
+不要假设切换会自动恢复。
+
+如果用户真正想要的是「停下来并关掉」，顺序是：`cancel_job` → 看 `resulting_status`
+（过渡态或 `null` 时用 `instance_status` 确认）→ 视情况 `power_off`。
 
 ## 不要做的事
 

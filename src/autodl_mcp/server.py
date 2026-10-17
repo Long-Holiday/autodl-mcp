@@ -99,7 +99,9 @@ def create_server(
         description=(
             "切换 GPU/无卡模式，立即返回后台任务 ID：关机、确认关机、按目标模式重新开机。"
             "会中断运行任务，重新开机会计费；执行前必须确认。无卡目标仅支持按量计费。"
-            "不是可回滚事务；失败或取消可能停在关机状态，不自动恢复。任务不跨服务重启恢复。"
+            "不是可回滚事务；失败或取消可能停在关机状态，不自动恢复。"
+            "关机后等待 GPU 时取消会停在关机状态，cancel_job 会返回当前 resulting_status。"
+            "任务不跨服务重启恢复。"
         ),
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
     )
@@ -141,7 +143,12 @@ def create_server(
         return await jobs().wait(job_id, timeout_seconds, return_on_capacity=return_on_capacity)
 
     @server.tool(
-        description="取消开机/切换任务的后续步骤，不撤销已接受的电源请求，不自动关机或恢复。",
+        description=(
+            "取消开机/切换任务的后续步骤，不撤销已接受的电源请求，不自动关机或恢复。"
+            "返回取消后立即查询的物理状态 resulting_status（含 resulting_start_mode）；"
+            "查询失败时为 null 并附 resulting_status_error，此时用 instance_status 确认。"
+            "resulting_status 为过渡态时仍需稍后复查。"
+        ),
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
     )
     async def cancel_job(job_id: str) -> dict[str, Any]:

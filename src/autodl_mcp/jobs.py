@@ -199,10 +199,29 @@ class Jobs:
         job = self.jobs[job_id]
         async with self._lock(job.instance_uuid):
             await self._cancel(job)
-            return {
+            result = {
                 **job.snapshot(),
-                "note": "只取消后续步骤，不撤销已接受的电源请求，不自动恢复或关机",
+                "resulting_status": None,
+                "resulting_start_mode": None,
+                "resulting_observed_at": None,
+                "resulting_status_error": None,
             }
+            note = "只取消后续步骤，不撤销已接受的电源请求，不自动恢复或关机；"
+            try:
+                observation = await self.client.status(job.instance_uuid, include_hardware=False)
+            except AutoDLError as exc:
+                result["resulting_status_error"] = exc.as_dict()
+                note += "取消后的物理状态查询失败，请调用 instance_status 确认后再决定"
+            else:
+                result["resulting_status"] = observation.get("status")
+                result["resulting_start_mode"] = observation.get("start_mode")
+                result["resulting_observed_at"] = observation.get("observed_at")
+                note += (
+                    "resulting_status 是取消后立即查询到的物理状态，"
+                    "已接受的电源请求仍可能继续改变它"
+                )
+            result["note"] = note
+            return result
 
     async def stop(self, instance_uuid: str) -> dict[str, Any]:
         self.settings.validate_uuid(instance_uuid)

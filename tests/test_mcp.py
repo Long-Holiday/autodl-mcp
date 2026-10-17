@@ -185,6 +185,8 @@ async def test_stdio_protocol_and_all_tools():
         )
         assert cancel.structured_content["phase"] == "cancelled"
         assert cancel.structured_content["suggested_next_poll_seconds"] is None
+        assert cancel.structured_content["resulting_status"] == "shutdown"
+        assert cancel.structured_content["resulting_status_error"] is None
         missing = await session.call_tool("job_status", {"job_id": "missing"})
         assert missing.is_error
         missing = await session.call_tool("wait_for_job", {"job_id": "missing"})

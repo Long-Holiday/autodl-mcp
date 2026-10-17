@@ -37,7 +37,7 @@ uv run autodl-mcp-install --dry-run     # 只看将要执行的命令
 | `power_off` | 关机，**会中断实例上正在运行的任务** |
 | `job_status` | 查后台开机任务的 phase / 重试时间 / 错误 |
 | `wait_for_job` | 短等待任务完成（默认最多 15 秒），缺货立即返回进度；不取消任务 |
-| `cancel_job` | 只取消后续尝试，不会关机 |
+| `cancel_job` | 只取消后续尝试，不会关机；返回取消后的物理状态 `resulting_status` |
 
 配套的技能文件会告诉 agent：开机前要先确认（会计费）、不要在 `confirming` 阶段重复发起、`cancel_job` 不等于关机、不同 `error.kind` 分别该怎么处理。
 
@@ -86,6 +86,10 @@ uv run autodl-mcp-install --dry-run     # 只看将要执行的命令
 
 这是**编排而非可回滚事务**。失败、取消或服务退出可能留下运行中、关机中或已关机的实例，
 不会自动回滚；取消不会撤销已经接受的电源请求。
+`cancel_job` 会返回取消后立即查询的物理状态 `resulting_status`（以及 `resulting_start_mode`）。
+例如关机完成后在 `waiting_capacity` 等 GPU 时取消，会直接得到 `resulting_status: "shutdown"`，
+不必再调 `instance_status`；过渡态（如 `starting` / `shutting_down`）或查询失败（`resulting_status` 为 `null`，
+原因见 `resulting_status_error`）时仍需复查。
 `power_off` 会先取消切换，防止其后续自动拉起。
 `stopping` 表示正在请求/确认关机，未观察到关机状态绝不开机。
 关机确认受 `stop_timeout` 限制，超时或结果不确定时停止切换，请查询实际状态再决定。

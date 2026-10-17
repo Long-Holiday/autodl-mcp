@@ -124,8 +124,25 @@ async def test_cancel_before_background_task_runs(no_gpu):
     job = await jobs.start("target", no_gpu=no_gpu)
     result = await jobs.cancel(job["job_id"])
     assert result["phase"] == "cancelled"
+    assert result["resulting_status"] == "shutdown"
+    assert result["resulting_status_error"] is None
     assert client.starts == 0
     assert client.stops == 0
+
+
+async def test_cancel_status_lookup_failure_still_cancels():
+    client = FakeClient()
+    client.hold_start = asyncio.Event()
+    jobs = Jobs(client)
+    job = await jobs.start("target")
+    await client.start_entered.wait()
+    client.status_error = AutoDLError("network", "请求超时")
+    result = await jobs.cancel(job["job_id"])
+    assert result["phase"] == "cancelled"
+    assert result["resulting_status"] is None
+    assert result["resulting_status_error"]["kind"] == "network"
+    assert "instance_status" in result["note"]
+    await jobs.close()
 
 
 async def test_shutdown_is_idempotent():
@@ -143,6 +160,8 @@ async def test_cancel_does_not_stop_running_instance(no_gpu):
     await completed(jobs, job)
     result = await jobs.cancel(job["job_id"])
     assert result["phase"] == "succeeded"
+    assert result["resulting_status"] == "running"
+    assert result["resulting_start_mode"] == ("non_gpu" if no_gpu else "gpu")
     assert client.state == "running"
     assert client.stops == 0
 
@@ -789,7 +808,8 @@ async def test_switch_cancel_during_shutdown_prevents_restart(action):
     job = await jobs.switch("target", "non_gpu")
     await entered.wait()
     if action == "cancel":
-        await jobs.cancel(job["job_id"])
+        cancel = await jobs.cancel(job["job_id"])
+        assert cancel["resulting_status"] == "shutting_down"
     elif action == "stop":
         await jobs.stop("target")
     else:
@@ -816,6 +836,24 @@ async def test_switch_gpu_capacity_reuses_switch_job():
     await jobs.stop("target")
     assert jobs.get(job["job_id"])["phase"] == "cancelled"
     assert client.starts == 1
+    await jobs.close()
+
+
+async def test_switch_cancel_during_capacity_reports_shutdown():
+    client = FakeClient(retry_interval=60, retry_max_interval=60)
+    client.state, client.start_mode = "running", "non_gpu"
+    client.capacity_failures = 1
+    jobs = Jobs(client)
+    job = await jobs.switch("target", "gpu")
+    result = await asyncio.wait_for(jobs.wait(job["job_id"], 120), 1)
+    assert result["phase"] == "waiting_capacity"
+    assert client.state == "shutdown"
+    cancel = await jobs.cancel(job["job_id"])
+    assert cancel["phase"] == "cancelled"
+    assert cancel["resulting_status"] == "shutdown"
+    assert cancel["resulting_start_mode"] == "non_gpu"
+    assert cancel["resulting_status_error"] is None
+    assert client.stops == client.starts == 1
     await jobs.close()
 
 
