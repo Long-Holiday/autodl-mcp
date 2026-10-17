@@ -13,6 +13,24 @@ async def test_pagination_and_secret_redaction():
     seen = []
 
     def handler(request):
+        if request.method == "GET":
+            assert request.url.path == "/api/v1/instance/snapshot"
+            assert dict(request.url.params) == {"instance_uuid": "target"}
+            return httpx.Response(
+                200,
+                json={
+                    "code": "Success",
+                    "data": {
+                        "snapshot_gpu_alias_name": "RTX 3090",
+                        "machine_info_snapshot": {
+                            "gpu_type": {"memory": 24 * 1024**3},
+                            "cpu_used": 14,
+                        },
+                        "root_password": "sensitive",
+                        "ssh_command": "secret ssh",
+                    },
+                },
+            )
         body = json.loads(request.content)
         seen.append(body)
         assert request.headers["Authorization"] == "secret-token"
@@ -50,6 +68,9 @@ async def test_pagination_and_secret_redaction():
         assert seen[0]["status"] == []
         assert result["start_mode"] == "non_gpu"
         assert result["charge_type"] == "payg"
+        assert result["gpu_name"] == "RTX 3090"
+        assert result["gpu_memory_gb"] == 24
+        assert result["cpu_cores"] == 14
         assert set(result) == {
             "instance_uuid",
             "status",
@@ -57,6 +78,9 @@ async def test_pagination_and_secret_redaction():
             "start_mode",
             "charge_type",
             "observed_at",
+            "gpu_name",
+            "gpu_memory_gb",
+            "cpu_cores",
         }
         assert "sensitive" not in str(result)
     finally:
@@ -216,7 +240,7 @@ async def test_server_can_cap_requested_page_size():
 
     client = AutoDLClient(Settings(token="test"), httpx.MockTransport(handler))
     try:
-        assert (await client.status("target"))["status"] == "running"
+        assert (await client.status("target", include_hardware=False))["status"] == "running"
     finally:
         await client.close()
 
@@ -341,8 +365,144 @@ async def test_status_mode_fields_are_optional_strings(value, expected):
         ),
     )
     try:
-        result = await client.status("target")
+        result = await client.status("target", include_hardware=False)
         assert result["start_mode"] == expected
         assert result["charge_type"] == expected
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    "name,memory,cores,expected",
+    [
+        ("A100", 80 * 1024**3, 32, ("A100", 80, 32)),
+        ("RTX 3090", 24 * 1024**3, 14, ("RTX 3090", 24, 14)),
+        (None, None, None, (None, None, None)),
+        ({}, "24GB", "14", (None, None, None)),
+        (" ", True, True, (None, None, None)),
+        (123, -1, -1, (None, None, None)),
+        ("A100", 0, 0, ("A100", 0, 0)),
+        ("A100", 1024**3, 1.5, ("A100", 1, None)),
+    ],
+)
+async def test_status_hardware_projection(name, memory, cores, expected):
+    seen = []
+
+    def handler(request):
+        seen.append(request.method)
+        if request.method == "POST":
+            data = {"list": [{"uuid": "target", "status": "shutdown"}], "result_total": 1}
+        else:
+            data = {
+                "snapshot_gpu_alias_name": name,
+                "machine_info_snapshot": {"gpu_type": {"memory": memory}, "cpu_used": cores},
+                "root_password": "private-password",
+                "jupyter_token": "private-token",
+            }
+        return httpx.Response(200, json={"code": "Success", "data": data})
+
+    client = AutoDLClient(Settings(token="test"), httpx.MockTransport(handler))
+    try:
+        result = await client.status("target")
+        assert tuple(result[k] for k in ("gpu_name", "gpu_memory_gb", "cpu_cores")) == expected
+        assert "private-" not in str(result)
+        assert seen == ["POST", "GET"]
+        seen.clear()
+        result = await client.status("target", include_hardware=False)
+        assert "gpu_name" not in result
+        assert seen == ["POST"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    "data", [{}, {"machine_info_snapshot": None}, {"machine_info_snapshot": {"gpu_type": []}}]
+)
+async def test_missing_hardware_fields(data):
+    client = AutoDLClient(
+        Settings(token="test"),
+        httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"code": "Success", "data": data})
+        ),
+    )
+    try:
+        assert await client._hardware("target") == {
+            "gpu_name": None,
+            "gpu_memory_gb": None,
+            "cpu_cores": None,
+        }
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    "status,kind",
+    [(401, "auth"), (403, "auth"), (429, "rate_limit"), (503, "network"), (302, "http")],
+)
+async def test_snapshot_http_failures_are_safe(status, kind):
+    client = AutoDLClient(
+        Settings(token="test"),
+        httpx.MockTransport(lambda request: httpx.Response(status, text="private-credential")),
+    )
+    try:
+        with pytest.raises(AutoDLError) as exc:
+            await client._hardware("target")
+        assert exc.value.kind == kind
+        assert not exc.value.ambiguous
+        assert "private-credential" not in str(exc.value)
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    "payload,kind",
+    [
+        ("not-json", "protocol"),
+        ("[]", "protocol"),
+        ('{"code":"Success","data":null}', "protocol"),
+        ('{"code":"Error","msg":"private-credential"}', "business"),
+        ('{"code":"AuthorizeFailed","msg":"private-credential"}', "auth"),
+    ],
+)
+async def test_snapshot_protocol_and_business_errors_are_safe(payload, kind):
+    client = AutoDLClient(
+        Settings(token="test"),
+        httpx.MockTransport(lambda request: httpx.Response(200, text=payload)),
+    )
+    try:
+        with pytest.raises(AutoDLError) as exc:
+            await client._hardware("target")
+        assert exc.value.kind == kind
+        assert not exc.value.ambiguous
+        assert "private-credential" not in str(exc.value)
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize("memory", [float("nan"), float("inf"), -float("inf"), 10**400])
+async def test_invalid_numeric_hardware(memory, monkeypatch):
+    client = AutoDLClient(Settings(token="test"))
+
+    async def request(*args, **kwargs):
+        return {"machine_info_snapshot": {"gpu_type": {"memory": memory}}}
+
+    monkeypatch.setattr(client, "_request", request)
+    try:
+        assert (await client._hardware("target"))["gpu_memory_gb"] is None
+    finally:
+        await client.close()
+
+
+async def test_snapshot_transport_error_is_safe():
+    def handler(request):
+        raise httpx.ReadTimeout("private-credential", request=request)
+
+    client = AutoDLClient(Settings(token="test"), httpx.MockTransport(handler))
+    try:
+        with pytest.raises(AutoDLError) as exc:
+            await client._hardware("target")
+        assert exc.value.kind == "network"
+        assert not exc.value.ambiguous
+        assert "private-credential" not in str(exc.value)
     finally:
         await client.close()

@@ -80,8 +80,15 @@ class AutoDLClient:
         await self.http.aclose()
 
     async def _post(self, path: str, body: dict[str, Any], *, mutation: bool = False) -> Any:
+        return await self._request("POST", path, body, mutation=mutation)
+
+    async def _request(
+        self, method: str, path: str, body: dict[str, Any], *, mutation: bool = False
+    ) -> Any:
         try:
-            response = await self.http.post(path, json=body)
+            response = await self.http.request(
+                method, path, **({"params": body} if method == "GET" else {"json": body})
+            )
         except httpx.TransportError:
             raise AutoDLError(
                 "network",
@@ -134,7 +141,38 @@ class AutoDLClient:
         # Never expose arbitrary upstream messages: they may contain credentials or account data.
         raise AutoDLError("business", "AutoDL 拒绝操作，请在控制台检查实例、账户及资源状态")
 
-    async def status(self, instance_uuid: str) -> dict[str, Any]:
+    async def _hardware(self, instance_uuid: str) -> dict[str, Any]:
+        data = await self._request(
+            "GET", "/api/v1/instance/snapshot", {"instance_uuid": instance_uuid}
+        )
+        if not isinstance(data, dict):
+            raise AutoDLError("protocol", "AutoDL 实例规格结构发生变化")
+        machine = data.get("machine_info_snapshot")
+        machine = machine if isinstance(machine, dict) else {}
+        gpu = machine.get("gpu_type")
+        gpu = gpu if isinstance(gpu, dict) else {}
+        memory = gpu.get("memory")
+        try:
+            memory_gb = (
+                float(memory) / 1024**3
+                if isinstance(memory, (int, float)) and not isinstance(memory, bool) and memory >= 0
+                else None
+            )
+        except OverflowError:
+            memory_gb = None
+        if memory_gb is not None and (not math.isfinite(memory_gb) or memory_gb < 0):
+            memory_gb = None
+        cores = machine.get("cpu_used")
+        name = data.get("snapshot_gpu_alias_name")
+        return {
+            "gpu_name": name if isinstance(name, str) and name.strip() else None,
+            "gpu_memory_gb": memory_gb,
+            "cpu_cores": cores
+            if isinstance(cores, int) and not isinstance(cores, bool) and cores >= 0
+            else None,
+        }
+
+    async def status(self, instance_uuid: str, *, include_hardware: bool = True) -> dict[str, Any]:
         self.settings.validate_uuid(instance_uuid)
         page = 1
         observed = 0
@@ -165,7 +203,7 @@ class AutoDLClient:
                 if row.get("uuid") == instance_uuid:
                     if not isinstance(row.get("status"), str) or not row["status"]:
                         raise AutoDLError("protocol", "AutoDL 实例缺少有效状态")
-                    return {
+                    result = {
                         "instance_uuid": instance_uuid,
                         "status": row["status"],
                         "sub_status": row.get("sub_status")
@@ -182,6 +220,9 @@ class AutoDLClient:
                         else None,
                         "observed_at": datetime.now(UTC).isoformat(),
                     }
+                    if include_hardware:
+                        result.update(await self._hardware(instance_uuid))
+                    return result
             observed += len(rows)
             if observed >= data["result_total"] or not rows:
                 raise AutoDLError("not_found", "未找到指定 UUID 的实例")

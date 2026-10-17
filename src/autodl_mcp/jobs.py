@@ -1,4 +1,5 @@
 import asyncio
+import math
 import random
 import time
 from dataclasses import dataclass, field
@@ -77,7 +78,7 @@ class Jobs:
             if self.closed:
                 raise ValueError("MCP 服务正在关闭")
             if instance_uuid in self.shutdown_pending:
-                status = await self.client.status(instance_uuid)
+                status = await self.client.status(instance_uuid, include_hardware=False)
                 if status["status"] not in STOPPED:
                     raise ValueError("该实例的关机尚未确认，请稍后查询状态")
                 self.shutdown_pending.remove(instance_uuid)
@@ -102,8 +103,26 @@ class Jobs:
             raise ValueError("任务不存在；任务仅保存在当前服务进程中")
         return self.jobs[job_id].snapshot()
 
+    async def wait(self, job_id: str, timeout_seconds: float = 300) -> dict[str, Any]:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 <= timeout_seconds <= 300
+            or not math.isfinite(timeout_seconds)
+        ):
+            raise ValueError("timeout_seconds 必须是 0 到 300 之间的有限秒数")
+        self.get(job_id)
+        job = self.jobs[job_id]
+        if job.phase in ACTIVE and job.task is not None and timeout_seconds > 0:
+            # asyncio.wait never cancels the job when this waiter times out or is cancelled.
+            await asyncio.wait({job.task}, timeout=timeout_seconds)
+        return job.snapshot()
+
     async def _cancel(self, job: Job) -> None:
         if job.task and not job.task.done():
+            job.task.add_done_callback(
+                lambda _: self._finish(job, "cancelled") if job.phase in ACTIVE else None
+            )
             job.task.cancel()
             await asyncio.gather(job.task, return_exceptions=True)
             if job.phase in ACTIVE:
@@ -122,7 +141,7 @@ class Jobs:
             self.shutdown_pending.add(instance_uuid)
             if job := self._active(instance_uuid):
                 await self._cancel(job)
-            status = await self.client.status(instance_uuid)
+            status = await self.client.status(instance_uuid, include_hardware=False)
             if status["status"] in STOPPED:
                 self.shutdown_pending.discard(instance_uuid)
                 return {**status, "accepted": False, "already_stopped": True}
@@ -152,7 +171,7 @@ class Jobs:
         job.next_retry_at = None
 
     async def _observe(self, job: Job) -> dict[str, Any]:
-        observation = await self.client.status(job.instance_uuid)
+        observation = await self.client.status(job.instance_uuid, include_hardware=False)
         job.last_status = observation["status"]
         return observation
 

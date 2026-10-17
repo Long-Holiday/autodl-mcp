@@ -2,7 +2,7 @@
 name: autodl
 description: 管理 AutoDL 容器实例：开机（含无卡模式）、关机、查询实例状态与后台开机任务；缺货时后台按指数退避自动重试，不要手动反复调用。Use when the user asks to start, stop, restart, or check an AutoDL instance, when a GPU instance is out of capacity and needs waiting, or when a task fails because the instance is powered off. Not for AutoDL Pro (专业版) instances.
 license: MIT
-allowed-tools: mcp__autodl__instance_status, mcp__autodl__job_status
+allowed-tools: mcp__autodl__instance_status, mcp__autodl__job_status, mcp__autodl__wait_for_job
 ---
 
 # AutoDL 实例管理
@@ -25,13 +25,15 @@ allowed-tools: mcp__autodl__instance_status, mcp__autodl__job_status
 2. 状态属于**可开机**集合（见下表）才继续；`running` / `starting` / `restarting` 说明已经在开机或已开机，直接告诉用户，不要重复发起。
 3. 确认后 `power_on(instance_uuid)`。它**立即返回**一个 `job_id`，真正的等待在后台进行。
 4. 向用户报告 `job_id`，并说明：缺货会在后台自动重试，不需要反复调用。
-5. 需要进度时 `job_status(job_id)`；`phase == "succeeded"` 表示实例已 `running` 且启动模式符合预期。
+5. 等待完成时 `wait_for_job(job_id, timeout_seconds=300)`，即时看进度用 `job_status(job_id)`；`phase == "succeeded"` 表示实例已 `running` 且启动模式符合预期。
 
 ### 用户要「等有空闲 GPU」
 
 不要循环调用 `power_on`。**只调用一次**，然后：
 - 用 `job_status(job_id)` 查看 `phase`：`waiting_capacity` 表示在等机器，`attempts` 是已尝试次数，`next_retry_at` 是下次重试时间。
-- 把 `next_retry_at` 告诉用户，或者按这个时间间隔再查一次，而不是每秒轮询。
+- 要等待结果时优先 `wait_for_job(job_id, timeout_seconds=300)`，不用 schedule 高频唤醒；任务结束立即返回，超时返回当前快照。若仍为活动 `phase`，可继续长轮询。
+- 等待范围 0–300 秒（0 立即返回）；宿主调用超时更短时缩短该值。等待超时或断开不会取消开机任务，也不会额外查询上游或重新开机。
+- 只需报告进度时，把 `next_retry_at` 告诉用户，不要每秒轮询。
 - 缺货重试间隔从 60 秒起步、逐步放大到 300 秒（可用 `AUTODL_RETRY_INTERVAL` / `AUTODL_RETRY_MAX_INTERVAL` 调整），所以短时间内频繁查询没有意义。
 
 ### 用户要「关机」
@@ -45,12 +47,20 @@ allowed-tools: mcp__autodl__instance_status, mcp__autodl__job_status
 
 | 工具 | 作用 | 读/写 |
 | --- | --- | --- |
-| `instance_status(instance_uuid)` | 查单个实例状态（`status`、`sub_status`、`start_mode`、`charge_type`）。不返回密码或 SSH 凭证 | 只读 |
+| `instance_status(instance_uuid)` | 查状态及 `gpu_name` / `gpu_memory_gb` / `cpu_cores` 配置规格。不返回密码或 SSH 凭证 | 只读 |
 | `power_on(instance_uuid)` | 申请 GPU 开机，立即返回 `job_id` | 计费 |
 | `power_on_no_gpu(instance_uuid)` | 无卡模式开机，不申请 GPU，立即返回 `job_id` | 计费 |
 | `power_off(instance_uuid)` | 关机，中断实例上的任务 | 破坏性 |
 | `job_status(job_id)` | 查后台开机任务的 `phase` / `attempts` / `error` / `next_retry_at` | 只读 |
+| `wait_for_job(job_id, timeout_seconds=300)` | 等任务结束或超时，返回当前任务快照；不取消任务 | 只读 |
 | `cancel_job(job_id)` | 停止某个开机任务的**后续尝试** | 写 |
+
+## 硬件配置判读
+
+`instance_status` 的硬件来自控制台「规格详情」配置快照，关机时也可查询。
+`gpu_memory_gb` 是单卡显存（字节 / 1024³，与控制台 GB 显示一致），`cpu_cores` 是实例分配的 vCPU 数，
+不是宿主总核数。缺失或无效的可选字段为 `null`，不要猜测型号对应的显存。
+无卡模式也可能返回 GPU 配置，**不代表当前有 GPU 可用**；分配 GPU 任务前仍须检查 `start_mode`。
 
 ## 状态判读
 

@@ -33,7 +33,8 @@ class FakeClient:
         self.start_entered = asyncio.Event()
         self.auto_running = True
 
-    async def status(self, uuid):
+    async def status(self, uuid, *, include_hardware=True):
+        assert include_hardware is False
         if self.status_error:
             raise self.status_error
         return {
@@ -291,7 +292,8 @@ async def test_more_than_five_network_failures_can_recover(clock):
     client = FakeClient(transient_retry_interval=60, transient_retry_max_interval=900)
     reads = 0
 
-    async def status(uuid):
+    async def status(uuid, *, include_hardware=True):
+        assert include_hardware is False
         nonlocal reads
         reads += 1
         if reads <= 10:
@@ -320,7 +322,8 @@ async def test_retry_after_is_minimum_before_next_read(clock):
     client = FakeClient(transient_retry_interval=60, transient_retry_max_interval=900)
     observed = []
 
-    async def status(uuid):
+    async def status(uuid, *, include_hardware=True):
+        assert include_hardware is False
         observed.append(clock.now)
         if len(observed) == 1:
             raise AutoDLError("rate_limit", "限流", retry_after=1800)
@@ -339,7 +342,8 @@ async def test_ambiguous_cooldown_exceeding_deadline_never_queries_or_resends(cl
     )
     reads = 0
 
-    async def status(uuid):
+    async def status(uuid, *, include_hardware=True):
+        assert include_hardware is False
         nonlocal reads
         reads += 1
         return {"status": client.state}
@@ -361,7 +365,8 @@ async def test_confirmation_reads_back_off_after_rate_limit(clock):
     )
     observed = []
 
-    async def status(uuid):
+    async def status(uuid, *, include_hardware=True):
+        assert include_hardware is False
         observed.append(clock.now)
         if len(observed) in {2, 3}:
             raise AutoDLError("rate_limit", "限流", retry_after=120)
@@ -498,7 +503,8 @@ async def test_no_gpu_confirmation_can_wait_for_mode(clock, ambiguous):
         if ambiguous:
             raise AutoDLError("network", "请求超时", ambiguous=True)
 
-    async def status(uuid):
+    async def status(uuid, *, include_hardware=True):
+        assert include_hardware is False
         nonlocal reads
         reads += 1
         return {
@@ -515,3 +521,97 @@ async def test_no_gpu_confirmation_can_wait_for_mode(clock, ambiguous):
     assert reads == 4
     assert client.starts == 1
     assert result["error"] is None
+
+
+@pytest.mark.parametrize("failed", [False, True])
+async def test_wait_returns_terminal_snapshot(failed):
+    client = FakeClient()
+    client.hold_start = asyncio.Event()
+    if failed:
+        client.start_error = AutoDLError("business", "拒绝")
+    jobs = Jobs(client)
+    job = await jobs.start("target")
+    await client.start_entered.wait()
+    waiter = asyncio.create_task(jobs.wait(job["job_id"]))
+    client.hold_start.set()
+    result = await asyncio.wait_for(waiter, 1)
+    assert result["phase"] == ("failed" if failed else "succeeded")
+    assert await jobs.wait(job["job_id"]) == result
+    await jobs.close()
+
+
+async def test_wait_timeout_and_cancelled_waiter_do_not_cancel_job():
+    client = FakeClient()
+    client.hold_start = asyncio.Event()
+    jobs = Jobs(client)
+    job = await jobs.start("target")
+    await client.start_entered.wait()
+    job_id = job["job_id"]
+    before = jobs.get(job_id)
+    assert await jobs.wait(job_id, 0) == before
+    assert await jobs.wait(job_id, 0.001) == before
+    waiter = asyncio.create_task(jobs.wait(job_id))
+    other = asyncio.create_task(jobs.wait(job_id))
+    # Schedule a turn so both waiters enter asyncio.wait before cancelling one.
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert not jobs.jobs[job_id].task.done()
+    assert client.starts == 1
+    client.hold_start.set()
+    result = await asyncio.wait_for(other, 1)
+    assert result["phase"] == "succeeded"
+    assert client.starts == 1
+    await jobs.close()
+
+
+@pytest.mark.parametrize("action", ["cancel", "close"])
+@pytest.mark.parametrize("before_run", [False, True])
+async def test_wait_job_cancellation(action, before_run):
+    client = FakeClient()
+    client.hold_start = asyncio.Event()
+    jobs = Jobs(client)
+    job = await jobs.start("target")
+    if not before_run:
+        await client.start_entered.wait()
+    waiter = asyncio.create_task(jobs.wait(job["job_id"]))
+    if action == "cancel":
+        await jobs.cancel(job["job_id"])
+    else:
+        await jobs.close()
+    result = await asyncio.wait_for(waiter, 1)
+    assert result["phase"] == "cancelled"
+    assert result["finished_at"] is not None
+    await jobs.close()
+
+
+async def test_wait_retains_job_after_eviction():
+    client = FakeClient()
+    client.hold_start = asyncio.Event()
+    jobs = Jobs(client)
+    job = await jobs.start("target")
+    await client.start_entered.wait()
+    waiter = asyncio.create_task(jobs.wait(job["job_id"]))
+    await asyncio.sleep(0)
+    # Simulate registry eviction while the waiter holds its reference.
+    del jobs.jobs[job["job_id"]]
+    client.hold_start.set()
+    assert (await asyncio.wait_for(waiter, 1))["phase"] == "succeeded"
+    await jobs.close()
+
+
+@pytest.mark.parametrize(
+    "timeout_value",
+    [-1, 301, True, False, None, "1", float("nan"), float("inf"), -float("inf"), 10**400],
+)
+async def test_wait_rejects_invalid_timeout(timeout_value):
+    jobs = Jobs(FakeClient())
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        await jobs.wait("missing", timeout_value)
+
+
+async def test_wait_missing_id():
+    jobs = Jobs(FakeClient())
+    with pytest.raises(ValueError, match="当前服务进程"):
+        await jobs.wait("missing")

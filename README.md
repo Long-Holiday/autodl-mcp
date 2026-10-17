@@ -29,14 +29,29 @@ uv run autodl-mcp-install --dry-run     # 只看将要执行的命令
 
 | 工具 | 作用 |
 | --- | --- |
-| `instance_status` | 查实例状态（不返回密码或 SSH 凭证） |
+| `instance_status` | 查实例状态及 GPU 型号、单卡显存、分配的 CPU 核心数（不返回凭证） |
 | `power_on` | 申请 GPU 开机，**立即返回 `job_id`**，缺货后台重试 |
 | `power_on_no_gpu` | 无卡模式开机（仅按量计费实例） |
 | `power_off` | 关机，**会中断实例上正在运行的任务** |
 | `job_status` | 查后台开机任务的 phase / 重试时间 / 错误 |
+| `wait_for_job` | 长轮询等待任务完成（默认最多 300 秒），超时返回当前状态，不取消任务 |
 | `cancel_job` | 只取消后续尝试，不会关机 |
 
 配套的技能文件会告诉 agent：开机前要先确认（会计费）、不要在 `confirming` 阶段重复发起、`cancel_job` 不等于关机、不同 `error.kind` 分别该怎么处理。
+
+### 硬件规格与等待任务
+
+`instance_status(instance_uuid)` 新增 `gpu_name`、`gpu_memory_gb`、`cpu_cores`。
+规格来自控制台「规格详情」的配置快照，关机时也可查询；缺失或无效的可选值为 `null`。
+`gpu_memory_gb` 是**单卡**显存，按 1024³ 字节换算（与控制台 GB 显示一致）；
+`cpu_cores` 是分配的 vCPU 数，不是宿主机总核数。无卡模式下返回的 GPU 配置不代表当前已挂载 GPU。
+
+开机得到 `job_id` 后，可调用 `wait_for_job(job_id, timeout_seconds=300)`，
+任务进入 `succeeded` / `failed` / `cancelled` 时立即返回，否则等待到期返回当前快照。
+`timeout_seconds` 范围为 0–300 秒，0 表示立即查询；若返回活动 `phase`，说明任务尚未结束，
+可继续长轮询。等待超时或中断不会取消后台任务，也不会增加上游查询或开机请求。
+仍可用 `job_status` 即时查看进度。宿主工具调用超时若短于 300 秒，请选用更短的等待时间。
+任务只保存在当前 MCP 进程中，不跨服务重启恢复。
 
 ## Token 怎么给
 
