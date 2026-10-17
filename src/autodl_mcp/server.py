@@ -110,9 +110,10 @@ def create_server(
 
     @server.tool(
         description=(
-            "查询当前进程中的开机/切换任务、尝试次数、累计耗时、重试时间和错误。"
-            "next_retry_in_seconds 为快照时距下次重试的剩余秒数"
-            "（向上取整，无重试时为 null）。"
+            "查询当前进程中的开机/切换任务、尝试次数、累计耗时和错误。"
+            "suggested_next_poll_seconds 为建议下次拉取状态前等待的秒数："
+            "缺货/网络退避时等于最近一次尝试间隔加当前倒计时，跨约两次尝试窗口；"
+            "其余等待阶段为当前倒计时（向上取整，无待定等待时为 null）。"
         ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
     )
@@ -124,9 +125,10 @@ def create_server(
             "只读等待当前进程任务结束、缺货或超时后返回快照；默认缺货立即返回。"
             "timeout_seconds 为 0–300 秒（默认 15，0 立即返回）。"
             "return_on_capacity=False 可等待穿过缺货阶段；活动 phase 表示尚未结束。"
-            "缺货返回后先汇报 attempts/elapsed_seconds/next_retry_in_seconds，不要紧密重复查询。"
-            "next_retry_in_seconds 为快照时距下次重试的剩余秒数"
-            "（向上取整，无重试时为 null）。"
+            "缺货返回后先汇报 attempts/elapsed_seconds/suggested_next_poll_seconds，"
+            "不要紧密重复查询。"
+            "suggested_next_poll_seconds 的含义同 job_status："
+            "退避阶段为最近一次尝试间隔加当前倒计时，其余为当前倒计时。"
             "本次等待超时或断开不会取消后台开机任务；任务不跨服务重启恢复。"
         ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),

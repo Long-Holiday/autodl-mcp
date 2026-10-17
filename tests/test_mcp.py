@@ -154,7 +154,7 @@ async def test_stdio_protocol_and_all_tools():
         )
         assert not pending.is_error
         assert pending.structured_content["phase"] == "waiting_capacity"
-        remaining = pending.structured_content["next_retry_in_seconds"]
+        remaining = pending.structured_content["suggested_next_poll_seconds"]
         assert type(remaining) is int
         assert 0 <= remaining <= 1
         immediate = await session.call_tool(
@@ -184,7 +184,7 @@ async def test_stdio_protocol_and_all_tools():
             },
         )
         assert cancel.structured_content["phase"] == "cancelled"
-        assert cancel.structured_content["next_retry_in_seconds"] is None
+        assert cancel.structured_content["suggested_next_poll_seconds"] is None
         missing = await session.call_tool("job_status", {"job_id": "missing"})
         assert missing.is_error
         missing = await session.call_tool("wait_for_job", {"job_id": "missing"})

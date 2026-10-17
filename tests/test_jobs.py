@@ -76,6 +76,9 @@ async def test_capacity_retry_then_success():
     assert result["attempts"] == 3
     assert result["last_status"] == "running"
     assert result["error"] is None
+    stored = jobs.jobs[result["job_id"]]
+    assert stored.previous_attempt_monotonic is not None
+    assert stored.last_attempt_monotonic is not None
     await jobs.close()
 
 
@@ -633,7 +636,7 @@ async def test_capacity_notification_wakes_all_waiters_without_cancelling_job():
     for result in results:
         assert result["phase"] == "waiting_capacity"
         assert result["attempts"] == 1
-        assert 0 < result["next_retry_in_seconds"] <= 60
+        assert 0 < result["suggested_next_poll_seconds"] <= 60
         assert result["elapsed_seconds"] >= 0
     assert client.starts == 1
     assert not jobs.jobs[job["job_id"]].task.done()
@@ -905,33 +908,80 @@ async def test_wait_rejects_nonboolean_capacity_flag(value):
 
 
 @pytest.mark.parametrize("phase", ["waiting_capacity", "waiting_network", "confirming"])
-async def test_retry_countdown_uses_monotonic_clock(monkeypatch, phase):
+async def test_suggested_poll_countdown_uses_monotonic_clock(monkeypatch, phase):
     now = 100.0
     monkeypatch.setattr(jobs_module.time, "monotonic", lambda: now)
     job = Job("target")
     jobs = Jobs(FakeClient())
-    assert job.snapshot()["next_retry_in_seconds"] is None
+    assert job.snapshot()["suggested_next_poll_seconds"] is None
 
     async def sleep(delay):
         nonlocal now
         assert delay == 2.5  # Clamped to the overall task deadline.
-        assert job.snapshot()["next_retry_in_seconds"] == 3
+        assert job.snapshot()["suggested_next_poll_seconds"] == 3
         now += 1.5
-        assert job.snapshot()["next_retry_in_seconds"] == 1
+        assert job.snapshot()["suggested_next_poll_seconds"] == 1
         now += 1
-        assert job.snapshot()["next_retry_in_seconds"] == 0
+        assert job.snapshot()["suggested_next_poll_seconds"] == 0
         now += 1
-        assert job.snapshot()["next_retry_in_seconds"] == 0
+        assert job.snapshot()["suggested_next_poll_seconds"] == 0
 
     monkeypatch.setattr(jobs_module.asyncio, "sleep", sleep)
     await jobs._wait(job, phase, 10, deadline=102.5)
-    assert job.snapshot()["next_retry_in_seconds"] is None
+    assert job.snapshot()["suggested_next_poll_seconds"] is None
+
+
+@pytest.mark.parametrize("phase", ["waiting_capacity", "waiting_network"])
+async def test_suggested_poll_includes_last_attempt_interval(monkeypatch, phase):
+    now = 100.0
+    monkeypatch.setattr(jobs_module.time, "monotonic", lambda: now)
+    job = Job("target")
+    job.previous_attempt_monotonic = 40.0
+    job.last_attempt_monotonic = 90.0  # Last attempt interval: 50 seconds.
+
+    async def sleep(delay):
+        nonlocal now
+        assert delay == 10
+        assert job.snapshot()["suggested_next_poll_seconds"] == 60  # 10 + 50
+        now += 8
+        assert job.snapshot()["suggested_next_poll_seconds"] == 52  # 2 + 50
+
+    monkeypatch.setattr(jobs_module.asyncio, "sleep", sleep)
+    await Jobs(FakeClient())._wait(job, phase, 10, deadline=None)
+
+
+@pytest.mark.parametrize("phase", ["confirming", "stopping"])
+async def test_suggested_poll_omits_attempt_interval_for_polling(monkeypatch, phase):
+    now = 100.0
+    monkeypatch.setattr(jobs_module.time, "monotonic", lambda: now)
+    job = Job("target")
+    job.previous_attempt_monotonic = 40.0
+    job.last_attempt_monotonic = 90.0
+
+    async def sleep(delay):
+        assert job.snapshot()["suggested_next_poll_seconds"] == 10
+
+    monkeypatch.setattr(jobs_module.asyncio, "sleep", sleep)
+    await Jobs(FakeClient())._wait(job, phase, 10, deadline=None)
+
+
+async def test_suggested_poll_without_attempt_history(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(jobs_module.time, "monotonic", lambda: now)
+    job = Job("target")
+    job.last_attempt_monotonic = 90.0  # First attempt: no previous interval yet.
+
+    async def sleep(delay):
+        assert job.snapshot()["suggested_next_poll_seconds"] == 10
+
+    monkeypatch.setattr(jobs_module.asyncio, "sleep", sleep)
+    await Jobs(FakeClient())._wait(job, "waiting_capacity", 10, deadline=None)
 
 
 @pytest.mark.parametrize("phase", ["succeeded", "failed", "cancelled"])
-def test_finish_clears_retry_countdown(phase):
+def test_finish_clears_suggested_poll_countdown(phase):
     jobs = Jobs(FakeClient())
     job = Job("target")
-    job.next_retry_monotonic = jobs_module.time.monotonic() + 60
+    job.next_poll_monotonic = jobs_module.time.monotonic() + 60
     jobs._finish(job, phase)
-    assert job.snapshot()["next_retry_in_seconds"] is None
+    assert job.snapshot()["suggested_next_poll_seconds"] is None

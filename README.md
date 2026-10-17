@@ -50,12 +50,13 @@ uv run autodl-mcp-install --dry-run     # 只看将要执行的命令
 
 开机或切换得到 `job_id` 后，可调用 `wait_for_job(job_id)`：默认最多等 **15 秒**，
 任务结束或发现缺货（`waiting_capacity`）时立即返回。即使显式传入 `timeout_seconds=120`，
-默认也不会在已知缺货时继续静默等待。快照包含 `attempts`、`elapsed_seconds`、`next_retry_in_seconds`。
-`next_retry_in_seconds` 是快照生成时距下次后台重试的剩余秒数，基于单调时钟计算、向上取整且不小于 0；
-无待定重试时为 `null`。它避免调用方用本地时钟计算时间差，但仍有传输和处理延迟，不代表资源可用倒计时。
+默认也不会在已知缺货时继续静默等待。快照包含 `attempts`、`elapsed_seconds`、`suggested_next_poll_seconds`。
+`suggested_next_poll_seconds` 是建议下次拉取状态前等待的秒数，基于单调时钟计算、向上取整且不小于 0；
+缺货/网络退避时等于最近一次尝试间隔加当前倒计时（约跨过两次尝试窗口），其余等待阶段就是当前倒计时；
+无待定等待时为 `null`。它避免调用方用本地时钟计算时间差，但仍有传输和处理延迟，不代表资源可用倒计时。
 `elapsed_seconds` 是任务累计耗时（终态固定），**不是平台承诺的排队时长或排位**。
 
-收到缺货快照后，先向用户报告尝试次数、已等待时间和距下次重试的剩余秒数，不要紧密重复调用。
+收到缺货快照后，先向用户报告尝试次数、已等待时间和建议的下次拉取间隔，不要紧密重复调用。
 需要继续短等待时用 `wait_for_job(job_id, timeout_seconds=15, return_on_capacity=False)`；
 显式长等待仍可使用 `timeout_seconds=120, return_on_capacity=False`。
 秒数范围为 0–300，0 立即返回；活动 phase 表示尚未完成。等待超时或中断不会取消后台任务，

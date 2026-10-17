@@ -27,6 +27,8 @@ ACTIVE = {
     "confirming",
     "stopping",
 }
+# 这些阶段的下一次动作是重新发起开机请求，建议拉取时间要跨过两次尝试窗口。
+RETRY_PHASES = {"waiting_capacity", "waiting_network"}
 
 
 @dataclass
@@ -45,11 +47,31 @@ class Job:
 
     started_monotonic: float = field(default_factory=lambda: time.monotonic(), repr=False)
     elapsed: float | None = field(default=None, repr=False)
-    next_retry_monotonic: float | None = field(default=None, repr=False)
+    next_poll_monotonic: float | None = field(default=None, repr=False)
+    previous_attempt_monotonic: float | None = field(default=None, repr=False)
+    last_attempt_monotonic: float | None = field(default=None, repr=False)
     capacity_ready: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
+        remaining = (
+            max(0, math.ceil(self.next_poll_monotonic - now))
+            if self.next_poll_monotonic is not None
+            else None
+        )
+        if remaining is None:
+            suggested = None
+        elif (
+            self.phase in RETRY_PHASES
+            and self.previous_attempt_monotonic is not None
+            and self.last_attempt_monotonic is not None
+        ):
+            last_interval = max(
+                0, math.ceil(self.last_attempt_monotonic - self.previous_attempt_monotonic)
+            )
+            suggested = remaining + last_interval
+        else:
+            suggested = remaining
         return {
             "job_id": self.job_id,
             "instance_uuid": self.instance_uuid,
@@ -63,9 +85,7 @@ class Job:
             "attempts": self.attempts,
             "last_status": self.last_status,
             "error": self.error,
-            "next_retry_in_seconds": max(0, math.ceil(self.next_retry_monotonic - now))
-            if self.next_retry_monotonic is not None
-            else None,
+            "suggested_next_poll_seconds": suggested,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
         }
@@ -206,7 +226,7 @@ class Jobs:
     def _finish(self, job: Job, phase: str) -> None:
         job.elapsed = max(0.0, time.monotonic() - job.started_monotonic)
         job.phase = phase
-        job.next_retry_monotonic = None
+        job.next_poll_monotonic = None
         job.finished_at = datetime.now(UTC).isoformat()
 
     async def _wait(self, job: Job, phase: str, delay: float, deadline: float | None) -> None:
@@ -216,14 +236,14 @@ class Jobs:
                 raise AutoDLError("timeout", "已达到开机最大等待时间")
             delay = min(delay, remaining)
         job.phase = phase
-        job.next_retry_monotonic = time.monotonic() + delay
+        job.next_poll_monotonic = time.monotonic() + delay
         if phase == "waiting_capacity":
             job.capacity_ready.set()
         else:
             job.capacity_ready.clear()
         await asyncio.sleep(delay)
         job.capacity_ready.clear()
-        job.next_retry_monotonic = None
+        job.next_poll_monotonic = None
 
     async def _observe(self, job: Job) -> dict[str, Any]:
         observation = await self.client.status(job.instance_uuid, include_hardware=False)
@@ -408,6 +428,8 @@ class Jobs:
                 if job.no_gpu and observation.get("charge_type") != "payg":
                     raise AutoDLError("state", "无卡模式开机仅支持按量计费实例")
                 job.phase = "starting"
+                job.previous_attempt_monotonic = job.last_attempt_monotonic
+                job.last_attempt_monotonic = time.monotonic()
                 job.attempts += 1
                 if job.no_gpu:
                     await self.client.power_on(job.instance_uuid, no_gpu=True)
