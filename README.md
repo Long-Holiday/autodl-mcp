@@ -57,7 +57,9 @@ uv run autodl-mcp-install --dry-run     # 只看将要执行的命令
 `elapsed_seconds` 是任务累计耗时（终态固定），**不是平台承诺的排队时长或排位**。
 
 收到缺货快照后，先向用户报告尝试次数、已等待时间和建议的下次拉取间隔，不要紧密重复调用。
-需要继续短等待时用 `wait_for_job(job_id, timeout_seconds=15, return_on_capacity=False)`；
+按 `suggested_next_poll_seconds` 用宿主定时调度器登记一次性唤醒（Antigravity CLI 为 `schedule`），
+到点再用 `job_status` 复核；不要用 shell `sleep` 盲等，也不要设置高频循环唤醒。
+宿主没有定时能力时，需要继续短等待才用 `wait_for_job(job_id, timeout_seconds=15, return_on_capacity=False)`；
 显式长等待仍可使用 `timeout_seconds=120, return_on_capacity=False`。
 秒数范围为 0–300，0 立即返回；活动 phase 表示尚未完成。等待超时或中断不会取消后台任务，
 也不会增加上游查询或开机请求。即时进度仍可用 `job_status` 查询。

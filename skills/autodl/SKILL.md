@@ -32,10 +32,10 @@ allowed-tools: mcp__autodl__instance_status, mcp__autodl__list_instances, mcp__a
 不要循环调用 `power_on`。**只调用一次**，然后：
 - 用 `job_status(job_id)` 查看 `phase`：`waiting_capacity` 表示在等机器，`attempts` 是已尝试次数，`suggested_next_poll_seconds` 是建议下次拉取前等待的秒数。
 - 首次用 `wait_for_job(job_id)`：默认最多 15 秒，发现缺货立即返回。先向用户汇报 `attempts`、累计耗时 `elapsed_seconds` 和 `suggested_next_poll_seconds`；累计耗时不是平台排位或保证的排队时长。
-- 不要对同一个缺货状态紧密重复调用。需要继续短等待时用 `wait_for_job(job_id, timeout_seconds=15, return_on_capacity=False)`；只有明确需要长等待时才加长秒数，最长 300 秒。不要 schedule 高频唤醒。
+- 不要对同一个缺货状态紧密重复调用。拿到 `suggested_next_poll_seconds` 后，用宿主的定时调度器登记一次性唤醒（Antigravity CLI 为 `schedule`：`DurationSeconds` 取建议值、至少 1 秒，`Prompt` 写明到点复核 `job_id`）；登记后继续手头工作，没有可推进工作时结束本轮等通知，到点再用 `job_status` 复核。不要用 shell `sleep` 盲等，也不要设置高频循环唤醒。宿主没有定时能力时，需要继续短等待才用 `wait_for_job(job_id, timeout_seconds=15, return_on_capacity=False)`；只有明确需要长等待时才加长秒数，最长 300 秒。
 - 等待范围 0–300 秒（0 立即返回）；宿主调用超时更短时缩短该值。等待超时或断开不会取消开机任务，也不会额外查询上游或重新开机。
 - `suggested_next_poll_seconds` 是建议下次拉取状态前等待的秒数（单调时钟计算、向上取整、最小为 0，无待定等待时为 `null`）。缺货/网络退避时 = 最近一次尝试间隔 + 当前倒计时，约跨过两次尝试窗口；首次尝试还没有历史间隔，或处于 `confirming` / `stopping` 轮询时，就是当前倒计时。需要相对等待时直接用它，无需计算本地时钟差；它不是资源可用倒计时，且仍有传输和处理延迟。
-- 建议值可能超过 300 秒，`wait_for_job` 单次上限 300 秒；超出时分段等待或用 `job_status` 复查。
+- 建议值可能超过 300 秒：定时器可直接按该值挂起；回退到 `wait_for_job` 时单次上限 300 秒，超出时分段等待或用 `job_status` 复查。
 - 只需报告进度时，把建议的下次拉取间隔告诉用户，不要每秒轮询。
 - 缺货重试间隔从 60 秒起步、逐步放大到 300 秒（可用 `AUTODL_RETRY_INTERVAL` / `AUTODL_RETRY_MAX_INTERVAL` 调整），所以短时间内频繁查询没有意义。
 
