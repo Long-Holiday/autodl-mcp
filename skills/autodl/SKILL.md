@@ -30,11 +30,12 @@ allowed-tools: mcp__autodl__instance_status, mcp__autodl__list_instances, mcp__a
 ### 用户要「等有空闲 GPU」
 
 不要循环调用 `power_on`。**只调用一次**，然后：
-- 用 `job_status(job_id)` 查看 `phase`：`waiting_capacity` 表示在等机器，`attempts` 是已尝试次数，`next_retry_at` 是下次重试时间。
-- 首次用 `wait_for_job(job_id)`：默认最多 15 秒，发现缺货立即返回。先向用户汇报 `attempts`、累计耗时 `elapsed_seconds` 和 `next_retry_at`；累计耗时不是平台排位或保证的排队时长。
+- 用 `job_status(job_id)` 查看 `phase`：`waiting_capacity` 表示在等机器，`attempts` 是已尝试次数，`next_retry_in_seconds` 是距下次重试的剩余秒数。
+- 首次用 `wait_for_job(job_id)`：默认最多 15 秒，发现缺货立即返回。先向用户汇报 `attempts`、累计耗时 `elapsed_seconds` 和 `next_retry_in_seconds`；累计耗时不是平台排位或保证的排队时长。
 - 不要对同一个缺货状态紧密重复调用。需要继续短等待时用 `wait_for_job(job_id, timeout_seconds=15, return_on_capacity=False)`；只有明确需要长等待时才加长秒数，最长 300 秒。不要 schedule 高频唤醒。
 - 等待范围 0–300 秒（0 立即返回）；宿主调用超时更短时缩短该值。等待超时或断开不会取消开机任务，也不会额外查询上游或重新开机。
-- 只需报告进度时，把 `next_retry_at` 告诉用户，不要每秒轮询。
+- `next_retry_in_seconds` 是快照时距下次后台重试的剩余秒数（单调时钟计算、向上取整、最小为 0，无待定重试时为 `null`）；需要相对等待时直接用它，无需计算本地时钟差。它不是资源可用倒计时，且仍有传输和处理延迟。
+- 只需报告进度时，把距下次重试的剩余秒数告诉用户，不要每秒轮询。
 - 缺货重试间隔从 60 秒起步、逐步放大到 300 秒（可用 `AUTODL_RETRY_INTERVAL` / `AUTODL_RETRY_MAX_INTERVAL` 调整），所以短时间内频繁查询没有意义。
 
 ### 用户要「关机」
@@ -54,7 +55,7 @@ allowed-tools: mcp__autodl__instance_status, mcp__autodl__list_instances, mcp__a
 | `power_on(instance_uuid)` | 申请 GPU 开机，立即返回 `job_id` | 计费 |
 | `power_on_no_gpu(instance_uuid)` | 无卡模式开机，不申请 GPU，立即返回 `job_id` | 计费 |
 | `power_off(instance_uuid)` | 关机，中断实例上的任务 | 破坏性 |
-| `job_status(job_id)` | 查后台开机任务的 `phase` / `attempts` / `error` / `next_retry_at` | 只读 |
+| `job_status(job_id)` | 查后台开机任务的 `phase` / `attempts` / `error` / `next_retry_in_seconds` | 只读 |
 | `wait_for_job(job_id)` | 默认最多 15 秒，缺货/结束/超时返回快照；不取消任务 | 只读 |
 | `cancel_job(job_id)` | 停止开机/切换任务的**后续步骤** | 写 |
 

@@ -3,7 +3,7 @@ import math
 import random
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -39,16 +39,17 @@ class Job:
     attempts: int = 0
     last_status: str | None = None
     error: dict[str, Any] | None = None
-    next_retry_at: str | None = None
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     finished_at: str | None = None
     task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     started_monotonic: float = field(default_factory=lambda: time.monotonic(), repr=False)
     elapsed: float | None = field(default=None, repr=False)
+    next_retry_monotonic: float | None = field(default=None, repr=False)
     capacity_ready: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
+        now = time.monotonic()
         return {
             "job_id": self.job_id,
             "instance_uuid": self.instance_uuid,
@@ -57,12 +58,14 @@ class Job:
             "target_mode": "non_gpu" if self.no_gpu else "gpu",
             "elapsed_seconds": self.elapsed
             if self.elapsed is not None
-            else max(0.0, time.monotonic() - self.started_monotonic),
+            else max(0.0, now - self.started_monotonic),
             "phase": self.phase,
             "attempts": self.attempts,
             "last_status": self.last_status,
             "error": self.error,
-            "next_retry_at": self.next_retry_at,
+            "next_retry_in_seconds": max(0, math.ceil(self.next_retry_monotonic - now))
+            if self.next_retry_monotonic is not None
+            else None,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
         }
@@ -203,7 +206,7 @@ class Jobs:
     def _finish(self, job: Job, phase: str) -> None:
         job.elapsed = max(0.0, time.monotonic() - job.started_monotonic)
         job.phase = phase
-        job.next_retry_at = None
+        job.next_retry_monotonic = None
         job.finished_at = datetime.now(UTC).isoformat()
 
     async def _wait(self, job: Job, phase: str, delay: float, deadline: float | None) -> None:
@@ -213,14 +216,14 @@ class Jobs:
                 raise AutoDLError("timeout", "已达到开机最大等待时间")
             delay = min(delay, remaining)
         job.phase = phase
-        job.next_retry_at = (datetime.now(UTC) + timedelta(seconds=delay)).isoformat()
+        job.next_retry_monotonic = time.monotonic() + delay
         if phase == "waiting_capacity":
             job.capacity_ready.set()
         else:
             job.capacity_ready.clear()
         await asyncio.sleep(delay)
         job.capacity_ready.clear()
-        job.next_retry_at = None
+        job.next_retry_monotonic = None
 
     async def _observe(self, job: Job) -> dict[str, Any]:
         observation = await self.client.status(job.instance_uuid, include_hardware=False)

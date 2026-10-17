@@ -6,7 +6,7 @@ import pytest
 import autodl_mcp.jobs as jobs_module
 from autodl_mcp.client import AutoDLError
 from autodl_mcp.config import Settings
-from autodl_mcp.jobs import Jobs
+from autodl_mcp.jobs import Job, Jobs
 
 
 class FakeClient:
@@ -633,7 +633,7 @@ async def test_capacity_notification_wakes_all_waiters_without_cancelling_job():
     for result in results:
         assert result["phase"] == "waiting_capacity"
         assert result["attempts"] == 1
-        assert result["next_retry_at"]
+        assert 0 < result["next_retry_in_seconds"] <= 60
         assert result["elapsed_seconds"] >= 0
     assert client.starts == 1
     assert not jobs.jobs[job["job_id"]].task.done()
@@ -902,3 +902,36 @@ async def test_switch_stop_during_start_confirmation_prevents_future_start():
 async def test_wait_rejects_nonboolean_capacity_flag(value):
     with pytest.raises(ValueError, match="return_on_capacity"):
         await Jobs(FakeClient()).wait("missing", return_on_capacity=value)
+
+
+@pytest.mark.parametrize("phase", ["waiting_capacity", "waiting_network", "confirming"])
+async def test_retry_countdown_uses_monotonic_clock(monkeypatch, phase):
+    now = 100.0
+    monkeypatch.setattr(jobs_module.time, "monotonic", lambda: now)
+    job = Job("target")
+    jobs = Jobs(FakeClient())
+    assert job.snapshot()["next_retry_in_seconds"] is None
+
+    async def sleep(delay):
+        nonlocal now
+        assert delay == 2.5  # Clamped to the overall task deadline.
+        assert job.snapshot()["next_retry_in_seconds"] == 3
+        now += 1.5
+        assert job.snapshot()["next_retry_in_seconds"] == 1
+        now += 1
+        assert job.snapshot()["next_retry_in_seconds"] == 0
+        now += 1
+        assert job.snapshot()["next_retry_in_seconds"] == 0
+
+    monkeypatch.setattr(jobs_module.asyncio, "sleep", sleep)
+    await jobs._wait(job, phase, 10, deadline=102.5)
+    assert job.snapshot()["next_retry_in_seconds"] is None
+
+
+@pytest.mark.parametrize("phase", ["succeeded", "failed", "cancelled"])
+def test_finish_clears_retry_countdown(phase):
+    jobs = Jobs(FakeClient())
+    job = Job("target")
+    job.next_retry_monotonic = jobs_module.time.monotonic() + 60
+    jobs._finish(job, phase)
+    assert job.snapshot()["next_retry_in_seconds"] is None

@@ -109,7 +109,11 @@ def create_server(
         return await jobs().switch(instance_uuid, target_mode)
 
     @server.tool(
-        description="查询当前进程中的开机/切换任务、尝试次数、累计耗时、重试时间和错误。",
+        description=(
+            "查询当前进程中的开机/切换任务、尝试次数、累计耗时、重试时间和错误。"
+            "next_retry_in_seconds 为快照时距下次重试的剩余秒数"
+            "（向上取整，无重试时为 null）。"
+        ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
     )
     async def job_status(job_id: str) -> dict[str, Any]:
@@ -120,7 +124,9 @@ def create_server(
             "只读等待当前进程任务结束、缺货或超时后返回快照；默认缺货立即返回。"
             "timeout_seconds 为 0–300 秒（默认 15，0 立即返回）。"
             "return_on_capacity=False 可等待穿过缺货阶段；活动 phase 表示尚未结束。"
-            "缺货返回后先汇报 attempts/elapsed_seconds/next_retry_at，不要紧密重复查询。"
+            "缺货返回后先汇报 attempts/elapsed_seconds/next_retry_in_seconds，不要紧密重复查询。"
+            "next_retry_in_seconds 为快照时距下次重试的剩余秒数"
+            "（向上取整，无重试时为 null）。"
             "本次等待超时或断开不会取消后台开机任务；任务不跨服务重启恢复。"
         ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
