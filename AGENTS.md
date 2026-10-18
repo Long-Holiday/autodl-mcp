@@ -21,7 +21,7 @@
 - **`mcp.json` 里不许出现 `${...}` 占位符。** 展开行为各家客户端都不一样，没展开时会静默变成字面量路径、只在启动时报一个看不懂的连接错误。改用相对形式 `uv run autodl-mcp`：`cwd` 默认就是插件根目录（Agent Plugins 规范这么定义）。
 - **只有一份 MCP 配置。** 实测 agy 1.4.0 读的是插件根目录的 `mcp.json`；1.3.5 时代只认 `mcp_config.json`，那一份已经删掉，不要再补。
 - **不许在对外文件里提别的 agent。** `tests/test_plugin.py` 扫描 `plugin.json`、`mcp.json`、`README.md`、`INSTALL.md`、`AGENTS.md`、`SKILL.md`、`install.py`，出现别人家的名字就失败——代码里出现意味着又接了一条安装路径，文档里出现意味着又在向别人承诺支持。
-- 技能的 `allowed-tools` 只列只读工具。开机/关机/取消会改账户状态，必须留给用户确认，不要预先放行。
+- 技能的 `allowed-tools` 只列只读工具，不无条件预先放行写操作。开机/关机/取消按用户本次或已明确的实验授权执行，覆盖的操作不重复请示；缺目标、超费用或影响其他任务时再确认。技能文案不替代宿主权限。
 - `plugin.json` 的字段集是封闭的（`$schema`、`name`、`version`、`description`、`author`、`homepage`、`repository`、`license`、`keywords`、`extensions`），加别的字段会被校验器忽略或报错。
 
 ## 开发

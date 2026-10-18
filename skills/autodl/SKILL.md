@@ -9,13 +9,13 @@ allowed-tools: mcp__autodl__instance_status, mcp__autodl__list_instances, mcp__a
 
 通过 `autodl` MCP 工具管理**普通 AutoDL 容器实例**（不适用于 Pro / 专业版）。所有操作都作用在真实账户上：**开机会计费，关机会中断实例上正在跑的任务**。
 
-## 动手前必须确认
+## 授权与目标
 
-1. **开机前**先跟用户确认实例 UUID 和「现在开机」这件事——开机即开始计费，且会一直计费到关机。
-2. **关机前**必须警告：实例上正在运行的任务会被中断，未保存的进度会丢失。除非用户明确说「关机」，不要主动关机。
-3. 用户没给 UUID 时，先问，不要猜。用 `instance_status` 探测到的 UUID 也要回显给用户确认。
+使用用户提供或项目中已经核实的实例 UUID，不猜目标。开机持续计费，关机会中断实例上的任务，执行前核实进程与产物。
 
-`power_on`、`power_on_no_gpu`、`power_off`、`switch_mode`、`cancel_job` 都是会改变账户/实例状态的操作，执行前要用一句话说明将要发生什么（含计费影响）。
+用户可以一次授权实验使用的实例、费用范围、缺卡等待和开关机用途；已有授权覆盖的无卡准备、转有卡、故障止付及任务取消关机不重复请示。明确选择“取消任务并关机”也构成对应任务专属实例的关机授权。缺少目标、超出费用/中断范围或实例仍有其他任务时再请求决策；不把一般实验授权扩大成释放实例或删除数据的许可。
+
+`power_on`、`power_on_no_gpu`、`power_off`、`switch_mode`、`cancel_job` 会改变实例状态；说明实际动作与费用影响，执行后核实。技能的只读 allowed-tools 不代表写操作被预先放行，宿主权限仍按实际配置执行。
 
 ## 标准流程
 
@@ -23,7 +23,7 @@ allowed-tools: mcp__autodl__instance_status, mcp__autodl__list_instances, mcp__a
 
 1. `instance_status(instance_uuid)` —— 先看现在是什么状态，避免重复开机。
 2. 状态属于**可开机**集合（见下表）才继续；`running` / `starting` / `restarting` 说明已经在开机或已开机，直接告诉用户，不要重复发起。
-3. 确认后 `power_on(instance_uuid)`。它**立即返回**一个 `job_id`，真正的等待在后台进行。
+3. 授权覆盖后 `power_on(instance_uuid)`。它**立即返回**一个 `job_id`，真正的等待在后台进行。
 4. 向用户报告 `job_id`，并说明：缺货会在后台自动重试，不需要反复调用。
 5. 等待完成时 `wait_for_job(job_id)`，即时看进度用 `job_status(job_id)`；`phase == "succeeded"` 表示实例已 `running` 且启动模式符合预期。
 
